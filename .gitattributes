@@ -1,0 +1,3 @@
+mediamtx/mediamtx.yml filter=git-crypt diff=git-crypt
+ffmpeg/*.ps1 filter=git-crypt diff=git-crypt
+ThermalLog/*.ps1 filter=git-crypt diff=git-crypt
