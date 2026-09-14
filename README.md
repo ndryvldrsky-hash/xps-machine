@@ -48,3 +48,24 @@ xps.txt` в основном репозитории `/config`). Раньше п�
 (`Stop-ScheduledTask` → убить осиротевший `ffmpeg.exe` по PID, НЕ широким
 `Get-Process|Stop-Process` — оборвёт текущую WinRM-сессию → `Start-ScheduledTask`), правка
 `.ps1` на диске не подхватывается уже запущенным процессом.
+
+
+## Оверлей телеметрии (2026-09-14/15)
+
+`ffmpeg/overlay_render.ps1` — фоновый PowerShell-рендерер PNG-слоя, тот же дизайн, что у камеры iMac
+(`/config/imac_camera/overlay_render.swift` в основном репозитории): три столбика-таблицы с подгруппами
+(Поток, Камера (ProcAmp), Сеть, Система, Сессия, Home Assistant), правый зеркальный. Два файла в
+`W:\ffmpeg\overlay\`: `overlay.png` (данные, раз в 2 с) и `clock.png` (дата и время с четырьмя
+знаками секунд, `$hz` раз в секунду, по умолчанию 2 — каждый герц стоит ~9% ядра). `webcam_push.ps1`
+запускает рендерер (проверка живости по `render.pid`), накладывает оба слоя фильтром `overlay`,
+пишет для него `progress.txt` (`-progress`) и `yavg.txt` (signalstats) и больше не рисует drawtext.
+Подгруппу «Home Assistant» рендерер забирает по HTTP с `http://192.168.77.2:8123/local/xps_overlay_extra.txt`
+(HA кладёт её раз в минуту, автоматизация «Камеры: данные HA в оверлеи»).
+
+Грабли Windows/ffmpeg, поймано вживую: путь с буквой диска в опции `file=` фильтра не проходит
+(относительный путь + `Set-Location`); `-re` у image2-входов душит конвейер до 0.6x — вместо него
+`-thread_queue_size 1`; `setpts=PTS-STARTPTS` на всех входах обязателен (dshow стартует с большой
+метки, слои с нуля — overlay ждал часами); переименовать файл поверх открытого ffmpeg нельзя —
+PNG пишется одним `WriteAllBytes`; имя функции `Measure` перехватывает алиас `Measure-Object`.
+Деплой файлов — `/config/.local/bin/xps_put.py <local> <remote> --bom` (кусками по 2000 символов
+base64, ровно один BOM), обратно — `xps_get.py`.
