@@ -105,3 +105,14 @@ essentials): OpenCL и Vulkan не вкомпилированы (`-init_hw_devic
 драйвером GT 640M 2019 года (`cuMemAllocAsync`), QSV мёртв (см. шапку `webcam_push.ps1`), из
 рабочего только `d3d11va` (декод h264/hevc — нам не нужен, вход yuyv/MJPEG) и `scale_d3d11`.
 Кодер и так аппаратный: MF выбирает «NVIDIA H.264 Encoder MFT». GDI+-рендерер — софт по определению.
+
+Проверено и full-сборкой (`W:\ffmpeg\ffmpeg-9.0.1-full_build`, скачана 2026-09-15 через задачу
+планировщика: curl + встроенный bsdtar читает 7z; оставлена на диске, ~0,65 ГБ, в проде НЕ используется).
+OpenCL там поднимается на обеих картах (`opencl=ocl:0.0` GT 640M, `1.0` HD 4000; без индекса —
+«More than one matching device»), Vulkan на GT 640M падает. Замер боевого графа на testsrc2, 20 с видео,
+CPU-время процесса: essentials/CPU 2250 мс, full/CPU 2531 мс, full + `overlay_opencl` для блока скопов
+на HD 4000 3094 мс, на GT 640M 4219 мс — GPU ХУЖЕ: hwupload/hwdownload кадра 640x480 на каждом
+кадре дороже самого наложения, а сами скопы (waveform/vectorscope/drawgraph) OpenCL-версий не имеют.
+Грабли: у `hwdownload` формат вывода только sw-формат кадра (`hwdownload,format=yuv420p,format=nv12`);
+yuva420p-кадр для OpenCL обязан быть чётных размеров, иначе «Failed to allocate frame to upload to»
+(блок 278x139 → `pad=ceil(iw/2)*2:ceil(ih/2)*2`).
