@@ -49,6 +49,15 @@ xps.txt` в основном репозитории `/config`). Раньше п�
 `Get-Process|Stop-Process` — оборвёт текущую WinRM-сессию → `Start-ScheduledTask`), правка
 `.ps1` на диске не подхватывается уже запущенным процессом.
 
+**У задач `MediaMTX` и `WebcamPush` снят лимит времени выполнения (`ExecutionTimeLimit = PT0S`,
+2026-09-15).** По умолчанию `Register-ScheduledTask` ставит 72 часа («остановить задачу, если
+выполняется дольше»), и планировщик считает только время бодрствования машины, сон не входит:
+mediamtx был убит ровно через 3 суток чистого аптайма (`LastTaskResult 0x41306`), камера в
+Frigate ушла в `unavailable`, а ffmpeg из `WebcamPush` вечно висел в `SYN_SENT` к `127.0.0.1:1935`.
+При пересоздании любой «вечной» задачи на XPS обязательно добавлять
+`New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero)` (плюс
+`-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`), иначе через три дня всё повторится.
+
 
 ## Оверлей телеметрии (2026-09-14/15)
 
