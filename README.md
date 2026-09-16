@@ -77,7 +77,8 @@ Frigate ушла в `unavailable`, а ffmpeg из `WebcamPush` вечно вис
 `-thread_queue_size 1`; `setpts=PTS-STARTPTS` на всех входах обязателен (dshow стартует с большой
 метки, слои с нуля — overlay ждал часами); переименовать файл поверх открытого ffmpeg нельзя —
 PNG пишется одним `WriteAllBytes`; имя функции `Measure` перехватывает алиас `Measure-Object`.
-Деплой файлов — `/config/.local/bin/xps_put.py <local> <remote> --bom` (кусками по 2000 символов
+Деплой файлов — **в первую очередь через MCP-сервер xps** (`xps_put` с `bom: true`; с 2026-09-16 правило: скрипт ниже
+конфликтует с постоянным WinRM-шеллом MCP — WSManFault InvalidSelectors). Запасной путь, только без MCP — `/config/.local/bin/xps_put.py <local> <remote> --bom` (кусками по 2000 символов
 base64, ровно один BOM), обратно — `xps_get.py`.
 
 ### Живые скопы «Сигнал» (2026-09-15)
