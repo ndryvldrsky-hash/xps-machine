@@ -16,6 +16,7 @@ xps.txt` в основном репозитории `/config`). Раньше п�
 |-----------------------------------|----------------------------------|------------|
 | `ffmpeg/variant_push.ps1`         | `W:\ffmpeg\variant_push.ps1`     | Варианты частоты xps_b<N> по требованию (runOnDemand в mediamtx): читает чистый xps_cam, кладёт оверлей/кольцо/часы/шарик, публикует xps_b<N> (2026-09-15) |
 | `ffmpeg/webcam_push.ps1`          | `W:\ffmpeg\webcam_push.ps1`      | Постоянный push веб-камеры в go2rtc/Frigate по RTMP (кодирование h264_mf, оверлей даты/времени/FPS/адресов/ProcAmp) |
+| `ffmpeg/sub_push.ps1`             | `W:\ffmpeg\sub_push.ps1`        | Субпоток xps_sub для архива на VPS по требованию (runOnDemand): чистый xps_cam → 640x360 10 к/с libx264 ~300 кбит/с (2026-09-18) |
 | `ffmpeg/build_dll.ps1`            | `W:\ffmpeg\build_dll.ps1`        | Исходник (инлайн C#) для `XpsCamProcAmp.dll` — DirectShow-обвязка чтения IAMVideoProcAmp |
 | `ffmpeg/XpsCamProcAmp.dll`        | `W:\ffmpeg\XpsCamProcAmp.dll`    | Собранный артефакт из `build_dll.ps1` (пересборка требует .NET на самой машине — держим готовую сборку, чтобы не компилировать при каждом старте, см. историю ниже) |
 | `ThermalLog/poll_thermal.ps1`     | `W:\ThermalLog\poll_thermal.ps1` | Опрос ACPI-температуры/загрузки CPU раз в минуту (Scheduled Task `ThermalLog`) |
