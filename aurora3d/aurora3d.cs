@@ -923,6 +923,114 @@ static class Aurora3D
     static readonly byte[] unpm = BuildUnpm();                 // unpm[a*256+c] = c*255/a — без деления в цикле
     static byte[] BuildUnpm() { var t = new byte[65536]; for (int a = 1; a < 256; a++) for (int c = 0; c <= a; c++) t[a * 256 + c] = (byte)(c * 255 / a); return t; }
 
+    // ===== Сборка всего кадра на видеокарте (21.09, ночь; пробный поток xps_gpu) =====
+    // ffmpeg камеры отдаёт чистый кадр 1080p yuv420p в канал \\.\pipe\aurora_cam; здесь на GPU: камера + аура-таблички
+    // (overlay.png рендерера ауры) + аврора + часы и шарик → yuv420p → свой ffmpeg только кодирует. Выключатель —
+    // W:\tools\aurora3d\composite_off.txt.
+    static readonly int CAMB = W * H * 3 / 2;
+    static byte[] camFrame = new byte[CAMB]; static long camSeq = 0; static volatile bool camOn = false;
+    static void CamLoop()
+    {
+        var buf = new byte[CAMB];
+        while (true)
+        {
+            NamedPipeServerStream ps = null;
+            try
+            {
+                ps = new NamedPipeServerStream("aurora_cam", PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.None, CAMB, 0);
+                ps.WaitForConnection(); Log("камера: ffmpeg подключился к aurora_cam");
+                while (true)
+                {
+                    int got = 0; while (got < CAMB) { int n = ps.Read(buf, got, CAMB - got); if (n <= 0) throw new IOException("камера: канал закрыт"); got += n; }
+                    lock (camLock) { var t = camFrame; camFrame = buf; buf = t; camSeq++; }
+                    camOn = true;
+                }
+            }
+            catch (Exception e) { camOn = false; Log(e.Message); }
+            finally { if (ps != null) try { ps.Dispose(); } catch { } }
+            Thread.Sleep(500);
+        }
+    }
+    static readonly object camLock = new object();
+    // аура-таблички: overlay.png пишет overlay_render.ps1 (2 раза в секунду) — перечитываем по времени изменения
+    static byte[] auraBgra; static volatile bool auraNew = false; static DateTime auraT = DateTime.MinValue; static volatile bool auraLoading = false;
+    static void AuraCheck()
+    {
+        const string f = @"W:\ffmpeg\overlay\overlay.png";
+        DateTime t; try { t = File.GetLastWriteTimeUtc(f); } catch { return; }
+        if (t == auraT || auraLoading) return;
+        auraLoading = true; auraT = t;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                byte[] raw; using (var fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) { raw = new byte[fs.Length]; int g = 0; while (g < raw.Length) { int k = fs.Read(raw, g, raw.Length - g); if (k <= 0) break; g += k; } }
+                using (var ms = new MemoryStream(raw)) using (var bm = new Bitmap(ms))
+                {
+                    if (bm.Width != W || bm.Height != H) return;
+                    var d = bm.LockBits(new Rectangle(0, 0, W, H), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                    var b = new byte[W * H * 4]; Marshal.Copy(d.Scan0, b, 0, b.Length); bm.UnlockBits(d);
+                    auraBgra = b; auraNew = true;
+                }
+            }
+            catch { auraT = DateTime.MinValue; }                          // PNG мог быть недописан — повторим на следующем кадре
+            finally { auraLoading = false; }
+        });
+    }
+    // часы (как drawtext ffmpeg): позиция и кегль — из clock_pos.txt рендерера ауры
+    static int clkX = 18, clkY = 18, clkFs = 16; static DateTime clkPosT = DateTime.MinValue;
+    static void ClockPosCheck()
+    {
+        const string f = @"W:\ffmpeg\overlay\clock_pos.txt";
+        try { var t = File.GetLastWriteTimeUtc(f); if (t == clkPosT) return; clkPosT = t; var p = File.ReadAllText(f).Trim().Split(' '); if (p.Length >= 3) { clkX = int.Parse(p[0]); clkY = int.Parse(p[1]); clkFs = int.Parse(p[2]); } } catch { }
+    }
+    static Bitmap clockBmp; static Graphics clockG; static Font clockFont; static int clockFontFs = 0;
+    static void DrawAuraExtras(long n)
+    {
+        // часы ГГГГ-ММ-ДД  ЧЧ:ММ:СС.сссс (кадр) — жёлтые с чёрным контуром, текстура обновляется на месте
+        if (clockFontFs != clkFs) { if (clockFont != null) clockFont.Dispose(); clockFont = new Font("Consolas", clkFs, FontStyle.Bold, GraphicsUnit.Pixel); clockFontFs = clkFs; }
+        if (clockBmp == null) { clockBmp = new Bitmap(1024, 96, PixelFormat.Format32bppArgb); clockG = Graphics.FromImage(clockBmp); clockG.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias; }
+        clockG.Clear(Color.Transparent);
+        string txt = DateTime.Now.ToString("yyyy-MM-dd  HH:mm:ss.ffff") + " (" + n + ")";
+        using (var sh = new SolidBrush(Color.FromArgb(230, 0, 0, 0))) using (var br = new SolidBrush(Color.FromArgb(255, 214, 90)))
+        {
+            foreach (var d in new[] { new[] { 0, 1 }, new[] { 2, 1 }, new[] { 1, 0 }, new[] { 1, 2 }, new[] { 2, 2 } }) clockG.DrawString(txt, clockFont, sh, d[0], d[1], StringFormat.GenericTypographic);
+            clockG.DrawString(txt, clockFont, br, 1, 1, StringFormat.GenericTypographic);
+        }
+        GL.ExtrasBegin();
+        var dd = clockBmp.LockBits(new Rectangle(0, 0, clockBmp.Width, clockBmp.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try { GL.DrawDynTex(dd.Scan0, clockBmp.Width, clockBmp.Height, clkX - 1, clkY - 1); } finally { clockBmp.UnlockBits(dd); }
+        // шарик по кругу (оборот за секунду при 25 к/с) с хвостом из 6 затухающих точек — как fx в webcam_push.ps1
+        double R = H / 2.0 - 22, F1 = 44;
+        for (int j = 6; j >= 0; j--)
+        {
+            double th = 2 * Math.PI * (n - j / 6.0) / 25.0, fs = F1 * (1 - 0.7 * j / 6), al = j == 0 ? 1 : 0.75 * (1 - j / 7.0);
+            GL.Dot(W / 2.0 + R * Math.Cos(th), H / 2.0 + R * Math.Sin(th), fs * 0.62, 1f, 214 / 255f, 90 / 255f, (float)al);
+        }
+        GL.ExtrasEnd();
+    }
+    // второй ffmpeg: только кодирует готовый кадр (stdin) → пробный xps_gpu
+    static Process encProc; static Stream encIn; static DateTime encStartT = DateTime.MinValue;
+    static void EncEnsure()
+    {
+        if (encProc != null && !encProc.HasExited) return;
+        if ((DateTime.Now - encStartT).TotalSeconds < 5) return;
+        encStartT = DateTime.Now;
+        try
+        {
+            var psi = new ProcessStartInfo(FFMPEG, "-hide_banner -loglevel warning -f rawvideo -pix_fmt yuv420p -s " + W + "x" + H + " -use_wallclock_as_timestamps 1 -i - " +
+                // проба: libx264 720p (оба NVENC заняты ffmpeg камеры, а MF в этом процессе Intel не отдаёт — «Could not open encoder»)
+                "-vf scale=1280:720:flags=fast_bilinear -c:v libx264 -preset ultrafast -tune zerolatency -g 50 -fps_mode cfr -r 25 -b:v 3M -f flv rtmp://127.0.0.1:1935/xps_gpu")
+            { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardError = true, CreateNoWindow = true };
+            encProc = Process.Start(psi);
+            encProc.ErrorDataReceived += (o, e) => { if (e.Data != null) Log("кодер: " + e.Data); };
+            encProc.BeginErrorReadLine();
+            encIn = encProc.StandardInput.BaseStream;
+            Log("кодер xps_gpu запущен, pid " + encProc.Id);
+        }
+        catch (Exception e) { Log("кодер: " + e.Message); encProc = null; }
+    }
+
     // ---------- главный цикл ----------
     static int Main()
     {
@@ -934,9 +1042,11 @@ static class Aurora3D
         new Thread(MqttLoop) { IsBackground = true }.Start();
         new Thread(SamplerLoop) { IsBackground = true }.Start();
         new Thread(OnvifLoop) { IsBackground = true }.Start();
+        new Thread(CamLoop) { IsBackground = true }.Start();
         GL.Init(W, H);
         Log("OpenGL: " + GL.Renderer);
         var outb = new byte[W * H * 5 / 2];   // yuva420p: Y, U, V, A
+        var compb = new byte[CAMB]; long compN = 0;                // собранный кадр yuv420p для xps_gpu
         var font = new Font("Consolas", 12f * SCF, FontStyle.Bold, GraphicsUnit.Pixel); labelFont = font;
         var shadow = new SolidBrush(Color.FromArgb(200, 0, 0, 0));
         var fmt = StringFormat.GenericTypographic;
@@ -949,7 +1059,7 @@ static class Aurora3D
                 pipe = new NamedPipeServerStream("aurora3d", PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.None, 0, W * H * 5 / 2);
                 pipe.WaitForConnection();
                 Log("читатель подключился");
-                var sw = Stopwatch.StartNew(); long frame = 0; int statN = 0; double statMs = 0, statW = 0, stDraw = 0, stLab = 0, stPost = 0; DateTime statT = DateTime.Now;
+                var sw = Stopwatch.StartNew(); long frame = 0; int statN = 0; double statMs = 0, statW = 0, stDraw = 0, stLab = 0, stPost = 0, stComp = 0; DateTime statT = DateTime.Now;
                 while (pipe.IsConnected)
                 {
                     var now = DateTime.Now; double dt = Math.Min(0.5, (now - prev).TotalSeconds); prev = now;
@@ -983,13 +1093,26 @@ static class Aurora3D
                     // итог на GPU: свечение (аддитивное) + подписи → прямая альфа → yuva420p (Y, U и V на ½, A) в 4 прохода шейдера;
                     // ffmpeg берёт кадр как есть, без растяжения и перевода цвета
                     GL.PostPassYuva(outb); stPost += sw.Elapsed.TotalMilliseconds - tC;
+                    // сборка всего кадра (пробный xps_gpu): только когда из ffmpeg камеры идут кадры
+                    if (camOn && !File.Exists(DIR + "composite_off.txt"))
+                    {
+                        double tD = sw.Elapsed.TotalMilliseconds;
+                        AuraCheck(); ClockPosCheck();
+                        if (auraNew) { GL.UploadAura(auraBgra, W, H); auraNew = false; }
+                        lock (camLock) GL.UploadCam(camFrame, W, H);
+                        DrawAuraExtras(compN++);
+                        GL.Composite(compb);
+                        EncEnsure();
+                        try { if (encIn != null) encIn.Write(compb, 0, compb.Length); } catch (Exception e) { Log("кодер: запись — " + e.Message); try { encProc.Kill(); } catch { } encProc = null; }
+                        stComp += sw.Elapsed.TotalMilliseconds - tD;
+                    }
                     var tw0 = sw.Elapsed.TotalMilliseconds; pipe.Write(outb, 0, outb.Length); statW += sw.Elapsed.TotalMilliseconds - tw0;
                     frame++;
                     // 25 к/с (40 мс на кадр); раз в минуту — фактическая частота и время кадра в журнал
                     long due = (long)(frame * 40) - sw.ElapsedMilliseconds;
                     if (due > 0) Thread.Sleep((int)due); else if (due < -1000) { frame = sw.ElapsedMilliseconds / 40; }
                     statN++; statMs += (DateTime.Now - now).TotalMilliseconds;
-                    if ((DateTime.Now - statT).TotalSeconds >= 20) { Log("кадров/с " + F(statN / (DateTime.Now - statT).TotalSeconds, "0.0") + ", кадр " + F(statMs / Math.Max(1, statN), "0.0") + " мс: сцена " + F(stDraw / Math.Max(1, statN), "0.0") + ", подписи " + F(stLab / Math.Max(1, statN), "0.0") + ", итог+считывание " + F(stPost / Math.Max(1, statN), "0.0") + ", запись в канал " + F(statW / Math.Max(1, statN), "0.0") + " мс; текстур подписей " + texOf.Count); statN = 0; statMs = 0; statW = 0; stDraw = stLab = stPost = 0; statT = DateTime.Now; }
+                    if ((DateTime.Now - statT).TotalSeconds >= 20) { Log("кадров/с " + F(statN / (DateTime.Now - statT).TotalSeconds, "0.0") + ", кадр " + F(statMs / Math.Max(1, statN), "0.0") + " мс: сцена " + F(stDraw / Math.Max(1, statN), "0.0") + ", подписи " + F(stLab / Math.Max(1, statN), "0.0") + ", итог+считывание " + F(stPost / Math.Max(1, statN), "0.0") + ", сборка кадра " + F(stComp / Math.Max(1, statN), "0.0") + ", запись в канал " + F(statW / Math.Max(1, statN), "0.0") + " мс; текстур подписей " + texOf.Count); statN = 0; statMs = 0; statW = 0; stDraw = stLab = stPost = stComp = 0; statT = DateTime.Now; }
                 }
             }
             catch (Exception e) { Log("выход: " + e.Message); }
@@ -1113,6 +1236,82 @@ static class GL
         bindFb(0x8D40, fbo1); glViewport(0, 0, W_, H_); glEnable(0x0BE2);
     }
     static uint fboB1, fboB2, texB1, texB2, progDown, progBlur; static int bw, bh, locD;
+    // ---- сборка всего кадра (камера + аура + аврора + часы) ----
+    [DllImport("opengl32.dll")] static extern void glTexSubImage2D(uint target, int level, int x, int y, int w, int h, uint fmt, uint type, IntPtr data);
+    [DllImport("opengl32.dll")] static extern void glTexSubImage2D(uint target, int level, int x, int y, int w, int h, uint fmt, uint type, byte[] data);
+    static uint texCY, texCU, texCV, texAura, tex4, fbo4, texClock, progC; static int locCMode;
+    static uint TexFmt(int w, int h, int ifmt, uint fmt)
+    {
+        uint t; glGenTextures(1, out t); glBindTexture(0x0DE1, t);
+        glTexImage2D(0x0DE1, 0, ifmt, w, h, 0, fmt, 0x1401, IntPtr.Zero);
+        glTexParameteri(0x0DE1, 0x2801, 0x2601); glTexParameteri(0x0DE1, 0x2800, 0x2601);
+        glTexParameteri(0x0DE1, 0x2802, 0x812F); glTexParameteri(0x0DE1, 0x2803, 0x812F);
+        glBindTexture(0x0DE1, 0); return t;
+    }
+    public static void UploadCam(byte[] yuv, int w, int h)
+    {
+        var hd = GCHandle.Alloc(yuv, GCHandleType.Pinned);
+        try
+        {
+            IntPtr p = hd.AddrOfPinnedObject(); glPixelStorei(0x0CF5, 1);
+            glBindTexture(0x0DE1, texCY); glTexSubImage2D(0x0DE1, 0, 0, 0, w, h, 0x1903, 0x1401, p);
+            glBindTexture(0x0DE1, texCU); glTexSubImage2D(0x0DE1, 0, 0, 0, w / 2, h / 2, 0x1903, 0x1401, IntPtr.Add(p, w * h));
+            glBindTexture(0x0DE1, texCV); glTexSubImage2D(0x0DE1, 0, 0, 0, w / 2, h / 2, 0x1903, 0x1401, IntPtr.Add(p, w * h + w * h / 4));
+            glBindTexture(0x0DE1, 0);
+        }
+        finally { hd.Free(); }
+    }
+    public static void UploadAura(byte[] bgra, int w, int h) { glBindTexture(0x0DE1, texAura); glTexSubImage2D(0x0DE1, 0, 0, 0, w, h, 0x80E1, 0x1401, bgra); glBindTexture(0x0DE1, 0); }
+    // слой часов и шарика (premultiplied, как подписи)
+    public static void ExtrasBegin()
+    {
+        bindFb(0x8D40, fbo4); glViewport(0, 0, W_, H_); glClearColor(0, 0, 0, 0); glClear(0x4000);
+        glMatrixMode(0x1701); var m = new float[16]; m[0] = 2f / W_; m[5] = -2f / H_; m[10] = -1; m[12] = -1; m[13] = 1; m[15] = 1; glLoadMatrixf(m);
+        glMatrixMode(0x1700); glLoadMatrixf(Id());
+        glEnable(0x0BE2); Fn<BlendSepFn>("glBlendFuncSeparate")(0x0302, 0x0303, 1, 0x0303);
+    }
+    public static void DrawDynTex(IntPtr bgra, int w, int h, int x, int y)
+    {
+        glEnable(0x0DE1); glColor4f(1, 1, 1, 1);
+        glBindTexture(0x0DE1, texClock); glTexSubImage2D(0x0DE1, 0, 0, 0, w, h, 0x80E1, 0x1401, bgra);
+        glBegin(0x0007); glTexCoord2f(0, 0); glVertex2f(x, y); glTexCoord2f(1, 0); glVertex2f(x + w, y); glTexCoord2f(1, 1); glVertex2f(x + w, y + h); glTexCoord2f(0, 1); glVertex2f(x, y + h); glEnd();
+        glBindTexture(0x0DE1, 0); glDisable(0x0DE1);
+    }
+    public static void Dot(double x, double y, double d, float r, float g, float b, float a)
+    {
+        glPointSize((float)d); glColor4f(r, g, b, a); glBegin(0); glVertex2f((float)x, (float)y); glEnd();
+    }
+    public static void ExtrasEnd() { glBlendFunc(1, 1); bindFb(0x8D40, fbo1); }
+    // сборка: 3 прохода (Y, U, V) в R8-цели, считывание в yuv420p
+    public static void Composite(byte[] outb)
+    {
+        glDisable(0x0BE2); glMatrixMode(0x1701); glLoadMatrixf(Id()); glMatrixMode(0x1700); glLoadMatrixf(Id());
+        var at = Fn<ActiveTexFn>("glActiveTexture");
+        uint[] tx = { texCY, texCU, texCV, texAura, tex1, tex3, texB1, tex4 };
+        for (int i = 7; i >= 0; i--) { at((uint)(0x84C0 + i)); glBindTexture(0x0DE1, tx[i]); }
+        Fn<UIntFn>("glUseProgram")(progC); glPixelStorei(0x0D05, 1);
+        var h = GCHandle.Alloc(outb, GCHandleType.Pinned);
+        try
+        {
+            IntPtr p0 = h.AddrOfPinnedObject(); int ys = W_ * H_, cs = (W_ / 2) * (H_ / 2);
+            uint[] fb = { fboY, fboU, fboV }; int[] off = { 0, ys, ys + cs };
+            for (int mode = 0; mode < 3; mode++)
+            {
+                int w = mode == 0 ? W_ : W_ / 2, hh = mode == 0 ? H_ : H_ / 2;
+                bindFb(0x8D40, fb[mode]); glViewport(0, 0, w, hh);
+                Fn<Uniform1iFn>("glUniform1i")(locCMode, mode);
+                glBegin(0x0007);
+                glTexCoord2f(0, 1); glVertex2f(-1, -1); glTexCoord2f(1, 1); glVertex2f(1, -1);
+                glTexCoord2f(1, 0); glVertex2f(1, 1); glTexCoord2f(0, 0); glVertex2f(-1, 1);
+                glEnd();
+                glReadPixels(0, 0, w, hh, 0x1903, 0x1401, IntPtr.Add(p0, off[mode]));
+            }
+        }
+        finally { h.Free(); }
+        Fn<UIntFn>("glUseProgram")(0);
+        for (int i = 7; i >= 0; i--) { at((uint)(0x84C0 + i)); glBindTexture(0x0DE1, 0); }
+        bindFb(0x8D40, fbo1); glViewport(0, 0, W_, H_); glEnable(0x0BE2);
+    }
     delegate void Uniform1fFn(int loc, float v);
     static uint TexLin(int w, int h)
     {
@@ -1265,6 +1464,34 @@ static class GL
             " c += (texture2D(t, uv + d * 1.3846153846).rgb + texture2D(t, uv - d * 1.3846153846).rgb) * 0.3162162162;" +
             " c += (texture2D(t, uv + d * 3.2307692308).rgb + texture2D(t, uv - d * 3.2307692308).rgb) * 0.0702702703; gl_FragColor = vec4(c, 1.0); }"));
         locD = Fn<UniformLocFn>("glGetUniformLocation")(progBlur, "d");
+        Fn<UIntFn>("glUseProgram")(0);
+        // сборка кадра: текстуры камеры (R8: Y, U, V), ауры (RGBA), слоя часов (FBO 4), динамическая текстура часов
+        texCY = TexFmt(w, h, 0x8229, 0x1903); texCU = TexFmt(w / 2, h / 2, 0x8229, 0x1903); texCV = TexFmt(w / 2, h / 2, 0x8229, 0x1903);
+        texAura = TexFmt(w, h, 0x8058, 0x80E1); texClock = TexFmt(1024, 96, 0x8058, 0x80E1);
+        tex4 = Tex(w, h); Fn<GenFn>("glGenFramebuffersEXT")(1, out fbo4); bindFb(FB, fbo4); fbTex(FB, 0x8CE0, 0x0DE1, tex4, 0); bindFb(FB, fbo1);
+        uint fc = Shader(0x8B30,
+            "uniform sampler2D cy, cu, cv, au, g, l, bl, ex; uniform int mode; uniform vec2 px; uniform float bk; varying vec2 uv;" +
+            "vec3 frame(vec2 t){ vec2 f = vec2(t.x, 1.0 - t.y);" +                                   // загруженные текстуры — сверху вниз
+            " float Y = (texture2D(cy, f).r * 255.0 - 16.0) / 219.0, U = (texture2D(cu, f).r * 255.0 - 128.0) / 224.0, V = (texture2D(cv, f).r * 255.0 - 128.0) / 224.0;" +
+            " vec3 c = clamp(vec3(Y + 1.402 * V, Y - 0.344136 * U - 0.714136 * V, Y + 1.772 * U), 0.0, 1.0);" +
+            " vec4 A = texture2D(au, f); c = mix(c, A.rgb, A.a);" +                                  // аура-таблички (прямая альфа)
+            " vec3 gc = min(texture2D(g, t).rgb + texture2D(bl, t).rgb * bk, vec3(1.0)); float ag = max(gc.r, max(gc.g, gc.b)) * 0.784;" +
+            " vec4 L = texture2D(l, t); float a = L.a + ag * (1.0 - L.a); vec3 pm = L.rgb + gc * 0.784 * (1.0 - L.a); c = pm + c * (1.0 - a);" +   // аврора
+            " vec4 E = texture2D(ex, t); c = E.rgb + c * (1.0 - E.a);" +                              // часы и шарик
+            " return c; }" +
+            "void main(){ vec3 c;" +
+            " if (mode == 0) c = frame(uv); else c = (frame(uv + vec2(-px.x, -px.y) * 0.5) + frame(uv + vec2(px.x, -px.y) * 0.5) + frame(uv + vec2(-px.x, px.y) * 0.5) + frame(uv + vec2(px.x, px.y) * 0.5)) * 0.25;" +
+            " float v; if (mode == 0) v = (16.0 + 65.481 * c.r + 128.553 * c.g + 24.966 * c.b) / 255.0;" +
+            " else if (mode == 1) v = (128.0 - 37.797 * c.r - 74.203 * c.g + 112.0 * c.b) / 255.0;" +
+            " else v = (128.0 + 112.0 * c.r - 93.786 * c.g - 18.214 * c.b) / 255.0;" +
+            " gl_FragColor = vec4(v, 0.0, 0.0, 1.0); }");
+        progC = Prog(vs, fc);
+        Fn<UIntFn>("glUseProgram")(progC);
+        string[] un = { "cy", "cu", "cv", "au", "g", "l", "bl", "ex" };
+        for (int i = 0; i < un.Length; i++) Fn<Uniform1iFn>("glUniform1i")(Fn<UniformLocFn>("glGetUniformLocation")(progC, un[i]), i);
+        Fn<Uniform2fFn>("glUniform2f")(Fn<UniformLocFn>("glGetUniformLocation")(progC, "px"), 1f / w, 1f / h);
+        Fn<Uniform1fFn>("glUniform1f")(Fn<UniformLocFn>("glGetUniformLocation")(progC, "bk"), 1.1f);
+        locCMode = Fn<UniformLocFn>("glGetUniformLocation")(progC, "mode");
         Fn<UIntFn>("glUseProgram")(0);
         progY = Fn<CreateProgramFn>("glCreateProgram")(); Fn<AttachFn>("glAttachShader")(progY, vs); Fn<AttachFn>("glAttachShader")(progY, fy); Fn<UIntFn>("glLinkProgram")(progY);
         Fn<UIntFn>("glUseProgram")(progY);
