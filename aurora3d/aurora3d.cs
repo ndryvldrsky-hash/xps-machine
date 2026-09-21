@@ -11,7 +11,7 @@
 //   События          — вспышки на оси времени: люди на камерах Frigate, SMS, обрыв связи с HA, падение VPN;
 //   Состояния        — дорожки под осью времени: Андрей снаружи, бойлер, блокировка XPS, VPN;
 //   Потоки           — частицы, скорость ∝ объёму: сеть и диск XPS, WAN Оптиплекса, VPN телефона.
-// Входы: собственный ffmpeg из чистого xps_sub (160x90 yuv444p 10 к/с); MQTT alena/aurora/data от HA (автоматизация
+// Входы: собственный ffmpeg из чистого xps_sub (160x90 yuv444p 25 к/с); MQTT alena/aurora/data от HA (автоматизация
 //   aurora_data_publish; логин/адрес берутся из appsettings.json HASS.Agent — пароль не дублируется); термо-лог
 //   W:\ThermalLog\latest.json; счётчики Windows; пинг HA.
 // Выход: канал \\.\pipe\aurora3d — сырой BGRA (прямая альфа) 960x540, ~10 к/с (файлом нельзя — ~2 ТБ записи в сутки).
@@ -121,7 +121,7 @@ static class Aurora3D
             try
             {
                 var psi = new ProcessStartInfo(FFMPEG, "-hide_banner -loglevel error -rtsp_transport tcp -i " + SRC +
-                    " -vf fps=10,scale=" + IW + ":" + IH + ",format=yuv444p -f rawvideo -")
+                    " -vf fps=25,scale=" + IW + ":" + IH + ",format=yuv444p -f rawvideo -")
                 { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
                 using (var p = Process.Start(psi))
                 {
@@ -161,7 +161,7 @@ static class Aurora3D
                         if (mn > 20)
                         {
                             double cx = mx / mn / IW, cy = my / mn / IH;
-                            if (pcx >= 0) { motX = motX * 0.8 + (cx - pcx) * 0.2 * 10; motY = motY * 0.8 + (cy - pcy) * 0.2 * 10; }
+                            if (pcx >= 0) { motX = motX * 0.8 + (cx - pcx) * 0.2 * 25; motY = motY * 0.8 + (cy - pcy) * 0.2 * 25; }   // доли кадра/с при 25 к/с
                             pcx = cx; pcy = cy;
                         }
                         else { motX *= 0.9; motY *= 0.9; pcx = -1; }
@@ -509,207 +509,31 @@ static class Aurora3D
     const double WF_D = 4.0, TN_D = 6.0;
     static readonly Color cSig = Color.FromArgb(64, 208, 255), cVec = Color.FromArgb(255, 96, 208);
 
-    static void DrawWaterfall(List<Slice> hs, float[,] dist, DateTime now)
+    // ===== 2026-09-21 (ночь): «тоннель грамматик» (просьба пользователя) =====
+    // Веер убран. Все 10 грамматик — 3D и делят круг поровну: десятигранный тоннель, каждая грамматика — своя грань,
+    // повёрнутая на свой угол (i·36°) вокруг оси взгляда. У кромки (z = 0) — «сейчас», вглубь к центру — прошлое за 20 с;
+    // кольца-метки ЧЧ:ММ:СС через 5 с уходят вдаль по всем граням. Выключенная грамматика — пустая грань.
+    // Грань в своих координатах: x — поперёк грани [−HW, HW], y = −TR + h·HMAX — высота данных над гранью, z — время.
+    const double TR = 1.0, TD = 6.0, HMAX = 0.62;
+    static readonly double HW = TR * Math.Tan(Math.PI / 10);
+    static float[] allM;
+    static double ZA(double age) { return -age / 20 * TD; }
+    static double WallAng(int i) { return i * 2 * Math.PI / GRAM.Length; }          // 0 — нижняя грань, дальше против часовой
+    static void WallBegin(int i) { GL.glPushMatrix(); GL.glRotatef((float)(WallAng(i) * 180 / Math.PI), 0, 0, 1); }
+    static void WallEnd() { GL.glPopMatrix(); }
+    static double Yh(double h) { return -TR + Math.Max(0, Math.Min(1, h)) * HMAX; }
+    static double N01(double v, double lo, double hi) { return double.IsNaN(v) ? 0 : Math.Max(0, Math.Min(1, (v - lo) / (hi - lo))); }
+    // подпись в координатах грани i
+    static void LW(int i, double x, double y, double z, string s, Color c, int align, float dy)
     {
-        var P = Persp(48, (double)W / H, 0.1, 40); var Vw = LookAt(0, 1.45, 2.9 / zoom, 0, 0.3, -1.6); var Mo = Orbit(0, 0.4, -2); var M = Mul(P, Mul(Vw, Mo));
-        Scene3D(P, Vw, Mo, 0, 0, W, H);
-        const double X0 = -1.55, XW = 3.1;
-        double d0 = Math.Sqrt(1.15 * 1.15 + (2.9 / zoom) * (2.9 / zoom));
-        Fog(d0 * 0.95, d0 + WF_D * 1.15);
-        foreach (var s in hs)
-        {
-            double age = (now - s.t).TotalSeconds; if (age > 20) continue;
-            if (s.wfV == null)
-            {
-                for (int x = 0; x + 1 < IW; x++)
-                {
-                    V(X0 + XW * x / (IW - 1), s.mean[x] / 255.0, 0, 0.25 * 0.95, 0.82 * 0.95, 0.95);
-                    V(X0 + XW * (x + 1) / (IW - 1), s.mean[x + 1] / 255.0, 0, 0.25 * 0.95, 0.82 * 0.95, 0.95);
-                }
-                s.wfV = vb.ToArray(); s.wfC = cb.ToArray(); vb.Clear(); cb.Clear();
-            }
-            GL.glPushMatrix(); GL.glTranslatef(0, 0, (float)(-age / 20 * WF_D));
-            GL.glVertexPointer(3, 0x1406, 0, s.wfV); GL.glColorPointer(4, 0x1406, 0, s.wfC); GL.glDrawArrays(0x0001, 0, s.wfV.Length / 3);
-            GL.glPopMatrix();
-        }
-        GL.glDisable(0x0B60);
-        if (dist != null)
-        {
-            for (int x = 0; x < IW; x++) for (int b = 0; b < YBINS; b++)
-                {
-                    float n = dist[x, b]; if (n <= 0) continue; double k = Math.Min(0.8, 0.12 + n / 20.0);
-                    V(X0 + XW * x / (IW - 1), (b + 0.5) / YBINS, 0.02, 0.25 * k, 0.82 * k, 1 * k);
-                }
-            GL.glPointSize(2); Flush(0x0000);
-        }
-        double a = 0.35;
-        V(X0, 0, 0, a, a, a); V(X0 + XW, 0, 0, a, a, a); V(X0, 0, 0, a, a, a); V(X0, 1, 0, a, a, a); V(X0, 0, 0, a, a, a); V(X0, 0, -WF_D, a, a, a);
-        for (int i = 0; i <= 4; i++) { double y = i / 4.0; V(X0, y, 0, a * 0.6, a * 0.6, a * 0.6); V(X0 + XW, y, 0, a * 0.6, a * 0.6, a * 0.6); }
-        var tick0 = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, now.Second / 5 * 5);
-        for (int i = 0; i <= 4; i++)
-        {
-            var tt = tick0.AddSeconds(-5 * i); double age = (now - tt).TotalSeconds; if (age > 20) continue; double z = -age / 20 * WF_D;
-            V(X0, 0, z, a, a, a); V(X0 + XW, 0, z, a, a, a);
-            float px, py; if (Proj(M, X0 - 0.05, 0, z, 0, 0, W, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px, py - 8, cAx, 1);
-        }
-        Flush(0x0001);
-        for (int i = 0; i <= 4; i++) { float px, py; if (Proj(M, X0 - 0.03, i / 4.0, 0, 0, 0, W, H, out px, out py)) L(((int)Math.Round(255 * i / 4.0)).ToString(), px, py - 7, cSig, 1); }
-        float lx, ly; if (Proj(M, X0, 1.08, 0, 0, 0, W, H, out lx, out ly)) L("Сигнал · Y 0–255, вглубь — время", lx, ly - 8, cSig, 0);
+        double a = WallAng(i), ca = Math.Cos(a), sa = Math.Sin(a); float px, py;
+        if (Proj(allM, x * ca - y * sa, x * sa + y * ca, z, 0, 0, W, H, out px, out py)) L(s, px, py + dy, c, align);
     }
-
-    // туман OpenGL (линейный, к чёрному): при аддитивном свечении чёрный = прозрачный — срезы гаснут с глубиной на GPU
-    static void Fog(double start, double end)
-    {
-        GL.glEnable(0x0B60); GL.glFogi(0x0B65, 0x2601); GL.glFogf(0x0B63, (float)start); GL.glFogf(0x0B64, (float)end);
-        GL.glFogfv(0x0B66, new float[] { 0, 0, 0, 0 });
-    }
+    static void Vk(double x, double y, double z, Color c, double k) { V(x, y, z, c.R / 255.0 * k, c.G / 255.0 * k, c.B / 255.0 * k); }
     static void HueColor(double u, double v, out double r, out double g, out double b)
     {
         double Y = 150, U = u * 32 * 3, Vv = v * 32 * 3;
         r = Math.Max(0, Math.Min(255, Y + 1.402 * Vv)) / 255; g = Math.Max(0, Math.Min(255, Y - 0.344 * U - 0.714 * Vv)) / 255; b = Math.Max(0, Math.Min(255, Y + 1.772 * U)) / 255;
-    }
-    static float[] tunM; static int tunVx;
-    static void DrawTunnel(List<Slice> hs, DateTime now, bool points)
-    {
-        tunVx = (W - H) / 2;
-        var P = Persp(58, 1, 0.1, 40); var Vw = LookAt(0.25, 0.35, 1.9 / zoom, 0, 0, -2.5); var Mo = Orbit(0, 0, -3); var M = Mul(P, Mul(Vw, Mo)); tunM = M;
-        Scene3D(P, Vw, Mo, tunVx, 0, H, H);
-        if (!points) return;
-        GL.glPointSize(2);
-        Fog(1.9 / zoom * 0.95, 1.9 / zoom + TN_D * 1.1);
-        foreach (var s in hs)
-        {
-            double age = (now - s.t).TotalSeconds; if (age > 20) continue;
-            if (s.tnV == null)
-            {
-                for (int i = 0; i < UVB; i++) for (int j = 0; j < UVB; j++)
-                    {
-                        float n = s.uv[i, j]; if (n <= 0) continue;
-                        double u = (i + 0.5) / UVB * 2 - 1, v = (j + 0.5) / UVB * 2 - 1, r, g, b; HueColor(u, v, out r, out g, out b);
-                        double k = Math.Min(0.9, 0.1 + n / 40.0);   // срез теперь из 1 кадра, а не из 2 — порог вдвое ниже
-                        V(u, v, 0, r * k, g * k, b * k);
-                    }
-                s.tnV = vb.ToArray(); s.tnC = cb.ToArray(); vb.Clear(); cb.Clear();
-            }
-            if (s.tnV.Length == 0) continue;
-            GL.glPushMatrix(); GL.glTranslatef(0, 0, (float)(-age / 20 * TN_D));
-            GL.glVertexPointer(3, 0x1406, 0, s.tnV); GL.glColorPointer(4, 0x1406, 0, s.tnC); GL.glDrawArrays(0x0000, 0, s.tnV.Length / 3);
-            GL.glPopMatrix();
-        }
-        GL.glDisable(0x0B60);
-        const double pure = 118.0;
-        var tick0 = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, now.Second / 5 * 5);
-        for (int ti = -1; ti <= 4; ti++)
-        {
-            double z = 0, k = 0.55; DateTime tt = now;
-            if (ti >= 0) { tt = tick0.AddSeconds(-5 * ti); double age = (now - tt).TotalSeconds; if (age > 20) continue; z = -age / 20 * TN_D; k = 0.28 * (1 - age / 20) + 0.08; }
-            foreach (int p in new[] { 5, 10, 15, 20, 25 })
-            {
-                if (ti >= 0 && p != 25) continue;
-                double rad = pure * p / 100 / 32;
-                for (int a = 0; a < 72; a++)
-                {
-                    double a0 = a * Math.PI / 36, a1 = (a + 1) * Math.PI / 36;
-                    V(rad * Math.Cos(a0), rad * Math.Sin(a0), z, k, 0.38 * k, 0.82 * k); V(rad * Math.Cos(a1), rad * Math.Sin(a1), z, k, 0.38 * k, 0.82 * k);
-                }
-                float px, py;
-                if (ti < 0 && Proj(M, -rad * 0.7071, -rad * 0.7071, 0, tunVx, 0, H, H, out px, out py)) L(p + " %", px - 4, py, cVec, 1);
-            }
-            if (ti >= 0) { float px, py; if (Proj(M, pure * 0.25 / 32, 0, z, tunVx, 0, H, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px + 4, py - 7, cAx, 0); }
-        }
-        var hues = new object[][] {
-            new object[] { "Кр", -38, 112, Color.FromArgb(255, 80, 80) }, new object[] { "Пр", 74, 94, Color.FromArgb(255, 90, 230) },
-            new object[] { "Сн", 112, -18, Color.FromArgb(110, 150, 255) }, new object[] { "Гл", 38, -112, Color.FromArgb(90, 230, 255) },
-            new object[] { "Зл", -74, -94, Color.FromArgb(100, 255, 110) }, new object[] { "Жл", -112, 18, Color.FromArgb(255, 230, 90) } };
-        double rr = pure * 0.27 / 32;
-        foreach (var h in hues)
-        {
-            double du = (int)h[1], dv = (int)h[2], l = Math.Sqrt(du * du + dv * dv), x = du / l * rr, y = dv / l * rr;
-            V(0, 0, 0, 0.2, 0.08, 0.16); V(x, y, 0, 0.2, 0.08, 0.16);
-            float px, py; if (Proj(M, x * 1.08, y * 1.08, 0, tunVx, 0, H, H, out px, out py)) L((string)h[0], px, py - 8, (Color)h[3], 2);
-        }
-        Flush(0x0001);
-        float lx, ly; if (Proj(M, 0, -pure * 0.25 / 32 - 0.12, 0, tunVx, 0, H, H, out lx, out ly)) L("Вектор · насыщенность, % от чистого цвета; вглубь — время", lx, ly, cVec, 2);
-    }
-
-    // направления — стрелки в тоннеле (север/верх кадра — вверх), след по глубине
-    static void DrawDirections(DateTime now)
-    {
-        if (tunM == null) return;
-        List<Pt> wb, ws, mx, my; lock (lk) { wb = Copy("wind_b"); ws = Copy("wind_s"); mx = Copy("mot_x"); my = Copy("mot_y"); }
-        var cW = Color.FromArgb(230, 240, 255); var cM = Color.FromArgb(120, 255, 140);
-        // ветер: откуда дует (метео) → куда: +180°
-        for (int i = 0; i < ws.Count && i < wb.Count; i++)
-        {
-            double age = (now - ws[i].t).TotalSeconds; if (age > 20) continue;
-            double a = (wb[i].v + 180) * Math.PI / 180, len = Math.Min(1, ws[i].v / 20) * 0.9, z = -age / 20 * TN_D, k = 0.15 + 0.6 * (1 - age / 20);
-            V(0, 0, z, cW.R / 255.0 * k * 0.3, cW.G / 255.0 * k * 0.3, cW.B / 255.0 * k * 0.3); V(Math.Sin(a) * len, Math.Cos(a) * len, z, cW.R / 255.0 * k, cW.G / 255.0 * k, cW.B / 255.0 * k);
-        }
-        for (int i = 0; i < mx.Count && i < my.Count; i += 2)
-        {
-            double age = (now - mx[i].t).TotalSeconds; if (age > 20) continue;
-            double vx = mx[i].v, vy = -my[i].v, l = Math.Sqrt(vx * vx + vy * vy); if (l < 0.02) continue;
-            double len = Math.Min(0.9, l * 3), z = -age / 20 * TN_D, k = 0.1 + 0.7 * (1 - age / 20);
-            V(0, 0, z, 0, 0, 0); V(vx / l * len, vy / l * len, z, cM.R / 255.0 * k, cM.G / 255.0 * k, cM.B / 255.0 * k);
-        }
-        GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1);
-        if (ws.Count > 0 && wb.Count > 0)
-        {
-            double a = (wb[wb.Count - 1].v + 180) * Math.PI / 180, len = Math.Min(1, ws[ws.Count - 1].v / 20) * 0.9; float px, py;
-            string[] dirs = { "С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ" };
-            string from = dirs[(int)Math.Round(wb[wb.Count - 1].v / 45) % 8];
-            object u; string unit; lock (lk) unit = mq.TryGetValue("wind_unit", out u) ? (string)u : "";
-            if (Proj(tunM, Math.Sin(a) * (len + 0.1), Math.Cos(a) * (len + 0.1), 0, tunVx, 0, H, H, out px, out py)) L("ветер " + F(ws[ws.Count - 1].v, "0.##") + " " + unit + " · из " + from, px, py - 8, cW, 2);
-        }
-    }
-    static List<Pt> Copy(string k) { List<Pt> l; return series.TryGetValue(k, out l) ? new List<Pt>(l) : new List<Pt>(); }
-
-    // наборы — водопад столбиков (ядра XPS, каналы электричества)
-    static void DrawSets(DateTime now)
-    {
-        List<SetSlice> ch, eh; string[] en; lock (lk) { ch = new List<SetSlice>(coresHist); eh = new List<SetSlice>(elecHist); en = elecNames; }
-        int vx = (int)(W * 0.33), vy = (int)(H * 0.52), vw = (int)(W * 0.34), vh = (int)(H * 0.36);
-        var P = Persp(40, (double)vw / vh, 0.1, 40); var Vw = LookAt(0, 1.5, 3.2 / zoom, 0, 0.2, -1); var Mo = Orbit(0, 0, -1); var M = Mul(P, Mul(Vw, Mo));
-        Scene3D(P, Vw, Mo, vx, vy, vw, vh);
-        var cC = Color.FromArgb(255, 150, 70); var cE = Color.FromArgb(255, 220, 90);
-        Action<List<SetSlice>, double, double, Func<double, double>, Color> bars = (hs, x0, xw, norm, c) =>
-        {
-            foreach (var s in hs)
-            {
-                double age = (now - s.t).TotalSeconds; if (age > 20 || s.v == null) continue;
-                double z = -age / 20 * 2.5, k = 0.15 + 0.75 * (1 - age / 20); int n = s.v.Length;
-                for (int i = 0; i < n; i++)
-                {
-                    double x = x0 + xw * (i + 0.5) / n, h = Math.Max(0.01, norm(s.v[i]));
-                    V(x, 0, z, c.R / 255.0 * k * 0.4, c.G / 255.0 * k * 0.4, c.B / 255.0 * k * 0.4); V(x, h, z, c.R / 255.0 * k, c.G / 255.0 * k, c.B / 255.0 * k);
-                }
-            }
-        };
-        bars(ch, -1.6, 1.0, v => (v - 30) / 70, cC);
-        bars(eh, -0.4, 2.0, v => Math.Sqrt(Math.Max(0, v) / 6000), cE);
-        GL.glLineWidth(4); Flush(0x0001); GL.glLineWidth(1);
-        float px, py;
-        if (ch.Count > 0 && ch[0].v != null && Proj(M, -1.1, -0.12, 0, vx, vy, vw, vh, out px, out py)) L("ядра XPS " + string.Join(" ", ch[0].v.Select(v => F(v, "0.#"))) + " °C", px, py, cC, 2);
-        // каналы электричества: над столбиком — только номер, расшифровка — две колонки под сценой
-        // (над столбиками подписи налезали друг на друга, справа — на колонку ауры)
-        if (eh.Count > 0 && eh[0].v != null)
-            for (int i = 0; i < en.Length && i < eh[0].v.Length; i++)
-            {
-                if (Proj(M, -0.4 + 2.0 * (i + 0.5) / en.Length, Math.Sqrt(Math.Max(0, eh[0].v[i]) / 6000) + 0.06, 0, vx, vy, vw, vh, out px, out py)) L((i + 1).ToString(), px, py - 12, cE, 2);
-                L((i + 1) + ". " + en[i] + " " + F(eh[0].v[i] / 1000, "0.##") + " кВт", vx + (i / 4) * vw / 2f, H - vy + 4 + (i % 4) * 13, cE, 0);
-            }
-        if (Proj(M, 0.6, -0.12, 0, vx, vy, vw, vh, out px, out py)) L("электричество 1…" + en.Length + " (слева направо)", px, py, cE, 2);
-    }
-
-    // 2D: свечение рамки
-    static void Glow(double t, double inset, double thick, Color c, double k)
-    {
-        double a = inset, b = inset + thick;
-        Action<double, double, double, double, double, double, double, double> q = (x0, y0, x1, y1, x2, y2, x3, y3) =>
-        { Vc(x0, y0, c, k); Vc(x1, y1, c, k); Vc(x2, y2, c, 0); Vc(x3, y3, c, 0); };
-        q(a, a, W - a, a, W - b, b, b, b); q(W - a, a, W - a, H - a, W - b, H - b, W - b, b);
-        q(W - a, H - a, a, H - a, b, H - b, W - b, H - b); q(a, H - a, a, a, b, b, b, H - b);
-        Flush(0x0007);
     }
     static Color TempColor(double t)
     {
@@ -718,109 +542,255 @@ static class Aurora3D
         for (int i = 0; i < 3; i++) if (t <= ts[i + 1]) { double f = (t - ts[i]) / (ts[i + 1] - ts[i]); return Color.FromArgb((int)(cs[i].R + (cs[i + 1].R - cs[i].R) * f), (int)(cs[i].G + (cs[i + 1].G - cs[i].G) * f), (int)(cs[i].B + (cs[i + 1].B - cs[i].B) * f)); }
         return cs[3];
     }
-
-    // 2D: линия по подвижной оси времени, значения нормируются в полосу [y0, y1]
-    static void TimeLine(List<Pt> l, DateTime now, double lo, double hi, double y0, double y1, Color c, double k)
+    static List<Pt> Copy(string k) { List<Pt> l; return series.TryGetValue(k, out l) ? new List<Pt>(l) : new List<Pt>(); }
+    // линия во времени по грани: x — полоса, значение → высота; «забор» до грани каждые step точек
+    static void WallLine(List<Pt> l, DateTime now, double x, double lo, double hi, Color c, int step)
     {
-        for (int i = 0; i + 1 < l.Count; i++)
+        for (int j = 0; j + 1 < l.Count; j++)
         {
-            if (double.IsNaN(l[i].v) || double.IsNaN(l[i + 1].v)) continue;
-            double xa = TX(l[i].t, now), xb = TX(l[i + 1].t, now); if (xb < 0) continue;
-            double ya = y1 - (y1 - y0) * Math.Max(0, Math.Min(1, (l[i].v - lo) / (hi - lo))), yb = y1 - (y1 - y0) * Math.Max(0, Math.Min(1, (l[i + 1].v - lo) / (hi - lo)));
-            Vc(xa, ya, c, k); Vc(xb, yb, c, k);
+            double a0 = (now - l[j].t).TotalSeconds, a1 = (now - l[j + 1].t).TotalSeconds; if (a0 > 20) continue;
+            double k = 0.25 + 0.7 * (1 - a0 / 20), y0 = Yh(N01(l[j].v, lo, hi)), y1 = Yh(N01(l[j + 1].v, lo, hi));
+            Vk(x, y0, ZA(a0), c, k); Vk(x, y1, ZA(a1), c, k);
+            if (step > 0 && j % step == 0) { Vk(x, -TR, ZA(a0), c, k * 0.18); Vk(x, y0, ZA(a0), c, k * 0.18); }
         }
     }
     static readonly Dictionary<string, List<double>> particles = new Dictionary<string, List<double>>();
     static readonly Random rnd = new Random();
-    static void Draw2D(DateTime now, double dt)
+
+    static void DrawAll(List<Slice> hs, float[,] dist, DateTime now, double dt)
     {
-        Scene2D();
-        bool anyTime = G("Свет и Движение") || G("Линии") || G("События") || G("Состояния");
-        Dictionary<string, List<Pt>> s; lock (lk) s = series.ToDictionary(kv => kv.Key, kv => new List<Pt>(kv.Value));
-        Func<string, List<Pt>> S = k => s.ContainsKey(k) ? s[k] : new List<Pt>();
-        if (G("Свечение"))
+        var P = Persp(62, (double)W / H, 0.05, 40); var Vw = LookAt(0, 0, 1.9 / zoom, 0, 0, -TD); var Mo = Orbit(0, 0, -TD / 2);
+        allM = Mul(P, Mul(Vw, Mo)); Scene3D(P, Vw, Mo, 0, 0, W, H);
+        int n = GRAM.Length; double cr = TR / Math.Cos(Math.PI / n);
+        Func<int, double> corner = j => -Math.PI / 2 + Math.PI / n + j * 2 * Math.PI / n;
+        // каркас: рёбра граней вдаль и кольца времени (через 5 с) с метками
+        for (int j = 0; j < n; j++) { double a = corner(j); Vk(cr * Math.Cos(a), cr * Math.Sin(a), 0, cAx, 0.22); Vk(cr * Math.Cos(a), cr * Math.Sin(a), -TD, cAx, 0.04); }
+        var tick0 = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, now.Second / 5 * 5);
+        for (int ti = -1; ti <= 4; ti++)
         {
-            var p = S("cpu_pkg"); double t = p.Count > 0 ? p[p.Count - 1].v : 0; var c = TempColor(t);
-            Glow(t, 0, 22, c, 0.75);
-            var d = S("det_fps"); double f = d.Count > 0 ? d[d.Count - 1].v : 0;
-            Glow(f, 22, 10, Color.FromArgb(255, 80, 230), Math.Min(1, f / 30) * 0.8);
-            L("свечение: CPU XPS " + F(t, "0.#") + " °C (до TjMax " + F(103 - t, "0.#") + ") · детектор Frigate " + F(f, "0.#") + " к/с", W / 2f, H - 64, c, 2);
+            double age = 0; DateTime tt = now;
+            if (ti >= 0) { tt = tick0.AddSeconds(-5 * ti); age = (now - tt).TotalSeconds; if (age > 20) continue; }
+            double z = ZA(age), k = ti < 0 ? 0.45 : 0.3 * (1 - age / 20) + 0.06;
+            for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(cr * Math.Cos(a0), cr * Math.Sin(a0), z, cAx, k); Vk(cr * Math.Cos(a1), cr * Math.Sin(a1), z, cAx, k); }
+            if (ti >= 0) { float px, py; if (Proj(allM, 0, TR, z, 0, 0, W, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px, py - 14, cAx, 2); }
         }
-        if (anyTime)
+        Flush(0x0001);
+        // названия граней у кромки
+        for (int i = 0; i < n; i++) LW(i, 0, -TR - 0.05, 0, GRAM[i] + (G(GRAM[i]) ? "" : " · выкл"), G(GRAM[i]) ? GCOL[i] : Color.FromArgb(120, 120, 120), 2, -6);
+
+        Dictionary<string, List<Pt>> S; lock (lk) S = series.ToDictionary(kv => kv.Key, kv => new List<Pt>(kv.Value));
+        Func<string, List<Pt>> Sr = k => S.ContainsKey(k) ? S[k] : new List<Pt>();
+        Func<string, double> Lst = k => { var l = Sr(k); return l.Count > 0 ? l[l.Count - 1].v : double.NaN; };
+
+        // 0 Сигнал — рельеф средней яркости по столбцам кадра, спереди — распределение текущего кадра
+        if (G(GRAM[0]) && haveInput)
         {
-            var t0 = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, now.Second / 10 * 10);
-            for (int i = 0; i <= 8; i++) { var tt = t0.AddSeconds(-10 * i); double x = TX(tt, now); if (x < 0) continue; Vc(x, 0, cAx, 0.16); Vc(x, H, cAx, 0.16); L(tt.ToString("HH:mm:ss"), (float)x, H - 16, cAx, 2); }
-            Flush(0x0001);
-        }
-        if (G("Свет и Движение"))
-        {
-            TimeLine(S("light"), now, 0, 255, 70, H - 70, Color.FromArgb(255, 140, 58), 0.95);
-            TimeLine(S("motion"), now, 0, 24, 70, H - 70, Color.FromArgb(96, 255, 128), 0.95);
-            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1);
-            for (int i = 0; i <= 4; i++)
+            WallBegin(0); GL.glBlendFunc(0x8001, 1);
+            foreach (var s in hs)
             {
-                float y = (float)(H - 70 - (H - 140) * i / 4.0);
-                L(((int)Math.Round(255 * i / 4.0)).ToString(), W / 2f - 4, y - 7, Color.FromArgb(255, 170, 110), 1); L((6 * i).ToString(), W / 2f + 4, y - 7, Color.FromArgb(120, 255, 150), 0);
+                double age = (now - s.t).TotalSeconds; if (age > 20) continue;
+                if (s.wfV == null)
+                {
+                    for (int x = 0; x + 1 < IW; x++) { V(-HW + 2 * HW * x / (IW - 1), Yh(s.mean[x] / 255.0), 0, 0.24, 0.78, 0.95); V(-HW + 2 * HW * (x + 1) / (IW - 1), Yh(s.mean[x + 1] / 255.0), 0, 0.24, 0.78, 0.95); }
+                    s.wfV = vb.ToArray(); s.wfC = cb.ToArray(); vb.Clear(); cb.Clear();
+                }
+                float k = (float)(0.85 * (1 - age / 20) + 0.08); GL.BlendColor(k, k, k, k);
+                GL.glPushMatrix(); GL.glTranslatef(0, 0, (float)ZA(age));
+                GL.glVertexPointer(3, 0x1406, 0, s.wfV); GL.glColorPointer(4, 0x1406, 0, s.wfC); GL.glDrawArrays(0x0001, 0, s.wfV.Length / 3);
+                GL.glPopMatrix();
             }
-            L("Свет Y 0–255", W / 2f - 4, 52, Color.FromArgb(255, 170, 110), 1); L("Движение ΔY 0–24", W / 2f + 4, 52, Color.FromArgb(120, 255, 150), 0);
+            GL.glBlendFunc(1, 1);
+            if (dist != null) { for (int x = 0; x < IW; x++) for (int b = 0; b < YBINS; b++) { float c = dist[x, b]; if (c > 0) Vk(-HW + 2 * HW * x / (IW - 1), Yh((b + 0.5) / YBINS), 0.01, GCOL[0], Math.Min(0.8, 0.12 + c / 20.0)); } GL.glPointSize(2); Flush(0x0000); }
+            WallEnd();
+            LW(0, HW, Yh(1), 0, "Y 255", GCOL[0], 0, -6);
         }
-        if (G("Линии"))
+        // 1 Вектор — точки цвета кадра: поперёк грани U, высота V
+        if (G(GRAM[1]) && haveInput)
         {
-            var to = S("t_out"); var pw = S("power_kw");
-            TimeLine(to, now, 10, 40, 110, H - 110, Color.FromArgb(150, 225, 255), 0.9);
-            TimeLine(pw, now, 0, 8, 110, H - 110, Color.FromArgb(255, 205, 90), 0.9);
-            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1);
-            if (to.Count > 0) L("улица " + F(to[to.Count - 1].v, "0.#") + " °C", W - 6, (float)(H - 110 - (H - 220) * Math.Max(0, Math.Min(1, (to[to.Count - 1].v - 10) / 30))) - 18, Color.FromArgb(150, 225, 255), 1);
-            if (pw.Count > 0) L("дом " + F(pw[pw.Count - 1].v, "0.##") + " кВт", W - 6, (float)(H - 110 - (H - 220) * Math.Max(0, Math.Min(1, pw[pw.Count - 1].v / 8))) + 4, Color.FromArgb(255, 205, 90), 1);
+            WallBegin(1); GL.glBlendFunc(0x8001, 1); GL.glPointSize(2);
+            foreach (var s in hs)
+            {
+                double age = (now - s.t).TotalSeconds; if (age > 20) continue;
+                if (s.tnV == null)
+                {
+                    for (int i = 0; i < UVB; i++) for (int j = 0; j < UVB; j++)
+                        {
+                            float c = s.uv[i, j]; if (c <= 0) continue;
+                            double u = (i + 0.5) / UVB * 2 - 1, v = (j + 0.5) / UVB * 2 - 1, r, g, b; HueColor(u, v, out r, out g, out b);
+                            double k = Math.Min(0.9, 0.1 + c / 40.0); V(u * HW, Yh((v + 1) / 2), 0, r * k, g * k, b * k);
+                        }
+                    s.tnV = vb.ToArray(); s.tnC = cb.ToArray(); vb.Clear(); cb.Clear();
+                }
+                if (s.tnV.Length == 0) continue;
+                float kf = (float)(0.12 + 0.88 * (1 - age / 20)); GL.BlendColor(kf, kf, kf, kf);
+                GL.glPushMatrix(); GL.glTranslatef(0, 0, (float)ZA(age));
+                GL.glVertexPointer(3, 0x1406, 0, s.tnV); GL.glColorPointer(4, 0x1406, 0, s.tnC); GL.glDrawArrays(0x0000, 0, s.tnV.Length / 3);
+                GL.glPopMatrix();
+            }
+            GL.glBlendFunc(1, 1);
+            // рамка окна U/V ±32 на кромке
+            Vk(-HW, Yh(0), 0, GCOL[1], 0.4); Vk(HW, Yh(0), 0, GCOL[1], 0.4); Vk(-HW, Yh(1), 0, GCOL[1], 0.4); Vk(HW, Yh(1), 0, GCOL[1], 0.4);
+            Vk(0, Yh(0), 0, GCOL[1], 0.25); Vk(0, Yh(1), 0, GCOL[1], 0.25); Flush(0x0001);
+            WallEnd();
+            LW(1, HW, Yh(1), 0, "U →, V ↑", GCOL[1], 0, -6);
         }
-        if (G("События"))
+        // 2 Свет и Движение
+        if (G(GRAM[2]))
+        {
+            WallBegin(2);
+            WallLine(Sr("light"), now, -HW * 0.45, 0, 255, Color.FromArgb(255, 140, 58), 6);
+            WallLine(Sr("motion"), now, HW * 0.45, 0, 24, Color.FromArgb(96, 255, 128), 6);
+            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            LW(2, -HW * 0.45, Yh(N01(Lst("light"), 0, 255)), 0, "свет " + F(Lst("light"), "0"), Color.FromArgb(255, 170, 110), 2, -16);
+            LW(2, HW * 0.45, Yh(N01(Lst("motion"), 0, 24)), 0, "движ. " + F(Lst("motion"), "0.#"), Color.FromArgb(120, 255, 150), 2, -16);
+        }
+        // 3 Линии — улица, потребление дома
+        if (G(GRAM[3]))
+        {
+            WallBegin(3);
+            WallLine(Sr("t_out"), now, -HW * 0.45, 10, 40, Color.FromArgb(150, 225, 255), 2);
+            WallLine(Sr("power_kw"), now, HW * 0.45, 0, 8, Color.FromArgb(255, 205, 90), 2);
+            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            LW(3, -HW * 0.45, Yh(N01(Lst("t_out"), 10, 40)), 0, "улица " + F(Lst("t_out"), "0.#") + " °C", Color.FromArgb(150, 225, 255), 2, -16);
+            LW(3, HW * 0.45, Yh(N01(Lst("power_kw"), 0, 8)), 0, "дом " + F(Lst("power_kw"), "0.##") + " кВт", Color.FromArgb(255, 205, 90), 2, -16);
+        }
+        // 4 Свечение — полоса цвета температуры CPU XPS (левая половина) и нагрузки детектора Frigate (правая)
+        if (G(GRAM[4]))
+        {
+            WallBegin(4);
+            var pk = Sr("cpu_pkg"); var df = Sr("det_fps");
+            for (int j = 0; j + 1 < pk.Count; j++)
+            {
+                double a0 = (now - pk[j].t).TotalSeconds, a1 = (now - pk[j + 1].t).TotalSeconds; if (a0 > 20) continue;
+                var c = TempColor(pk[j].v); double k = 0.2 + 0.6 * (1 - a0 / 20), y = -TR + 0.01 + N01(pk[j].v, 40, 103) * 0.25;
+                Vk(-HW, y, ZA(a0), c, k); Vk(-0.02, y, ZA(a0), c, k); Vk(-0.02, y, ZA(a1), c, k); Vk(-HW, y, ZA(a1), c, k);
+            }
+            for (int j = 0; j + 1 < df.Count; j++)
+            {
+                double a0 = (now - df[j].t).TotalSeconds, a1 = (now - df[j + 1].t).TotalSeconds; if (a0 > 20) continue;
+                var c = Color.FromArgb(255, 80, 230); double k = (0.15 + 0.6 * (1 - a0 / 20)) * Math.Max(0.15, N01(df[j].v, 0, 30)), y = -TR + 0.01;
+                Vk(0.02, y, ZA(a0), c, k); Vk(HW, y, ZA(a0), c, k); Vk(HW, y, ZA(a1), c, k); Vk(0.02, y, ZA(a1), c, k);
+            }
+            Flush(0x0007); WallEnd();
+            double t = Lst("cpu_pkg");
+            LW(4, -HW * 0.5, -TR + 0.3, 0, "CPU " + F(t, "0.#") + " °C · до TjMax " + F(103 - t, "0.#"), TempColor(t), 2, -8);
+            LW(4, HW * 0.5, -TR + 0.18, 0, "детектор " + F(Lst("det_fps"), "0.#") + " к/с", Color.FromArgb(255, 80, 230), 2, -8);
+        }
+        // 5 Наборы — столбики: 4 ядра XPS, 8 каналов электричества
+        if (G(GRAM[5]))
+        {
+            List<SetSlice> ch, eh; string[] en; lock (lk) { ch = new List<SetSlice>(coresHist); eh = new List<SetSlice>(elecHist); en = elecNames; }
+            WallBegin(5);
+            Action<List<SetSlice>, double, double, Func<double, double>, Color> bars = (hl, x0, xw, norm, c) =>
+            {
+                foreach (var s in hl)
+                {
+                    double age = (now - s.t).TotalSeconds; if (age > 20 || s.v == null) continue; double k = 0.2 + 0.7 * (1 - age / 20);
+                    for (int j = 0; j < s.v.Length; j++) { double x = x0 + xw * (j + 0.5) / s.v.Length; Vk(x, -TR, ZA(age), c, k * 0.35); Vk(x, Yh(norm(s.v[j])), ZA(age), c, k); }
+                }
+            };
+            bars(ch, -HW, HW * 0.62, v => (v - 30) / 70, Color.FromArgb(255, 150, 70));
+            bars(eh, -HW * 0.3, HW * 1.3, v => Math.Sqrt(Math.Max(0, v) / 6000), Color.FromArgb(255, 220, 90));
+            GL.glLineWidth(3); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            if (ch.Count > 0 && ch[0].v != null) LW(5, -HW * 0.69, -TR + 0.1, 0, "ядра " + string.Join(" ", ch[0].v.Select(v => F(v, "0"))), Color.FromArgb(255, 150, 70), 2, 10);
+            if (eh.Count > 0 && eh[0].v != null)
+                for (int j = 0; j < en.Length && j < eh[0].v.Length; j++)
+                    LW(5, -HW * 0.3 + HW * 1.3 * (j + 0.5) / en.Length, Yh(Math.Sqrt(Math.Max(0, eh[0].v[j]) / 6000)), 0, (j + 1).ToString(), Color.FromArgb(255, 220, 90), 2, -14);
+        }
+        // 6 Направления — стрелки на грани: ветер (слева), движение картинки (справа); поперёк — восток/вправо, вверх — север/вверх
+        if (G(GRAM[6]))
+        {
+            WallBegin(6);
+            var wb = Sr("wind_b"); var ws = Sr("wind_s"); var mx = Sr("mot_x"); var my = Sr("mot_y");
+            var cW = Color.FromArgb(230, 240, 255); var cM = Color.FromArgb(120, 255, 140);
+            for (int j = 0; j < ws.Count && j < wb.Count; j++)
+            {
+                double age = (now - ws[j].t).TotalSeconds; if (age > 20) continue;
+                double a = (wb[j].v + 180) * Math.PI / 180, len = Math.Min(1, ws[j].v / 20) * 0.28, k = 0.2 + 0.7 * (1 - age / 20), x0 = -HW * 0.5, y0 = -TR + 0.3;
+                Vk(x0, y0, ZA(age), cW, k * 0.3); Vk(x0 + Math.Sin(a) * len, y0 + Math.Cos(a) * len, ZA(age), cW, k);
+            }
+            for (int j = 0; j < mx.Count && j < my.Count; j += 3)
+            {
+                double age = (now - mx[j].t).TotalSeconds; if (age > 20) continue;
+                double vx = mx[j].v, vy = -my[j].v, l = Math.Sqrt(vx * vx + vy * vy); if (l < 0.02) continue;
+                double len = Math.Min(0.28, l), k = 0.15 + 0.75 * (1 - age / 20), x0 = HW * 0.5, y0 = -TR + 0.3;
+                Vk(x0, y0, ZA(age), cM, k * 0.2); Vk(x0 + vx / l * len, y0 + vy / l * len, ZA(age), cM, k);
+            }
+            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            object u; string unit; lock (lk) unit = mq.TryGetValue("wind_unit", out u) ? (string)u : "";
+            string[] dirs = { "С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ" };
+            double wbl = Lst("wind_b");
+            if (!double.IsNaN(wbl)) LW(6, -HW * 0.5, -TR + 0.62, 0, "ветер " + F(Lst("wind_s"), "0.#") + " " + unit + " из " + dirs[(int)Math.Round(wbl / 45) % 8], cW, 2, -8);
+            LW(6, HW * 0.5, -TR + 0.62, 0, "движение в кадре", cM, 2, -8);
+        }
+        // 7 События — всплески на грани в момент события
+        if (G(GRAM[7]))
         {
             List<Ev> ev; lock (lk) ev = new List<Ev>(events);
+            WallBegin(7);
             foreach (var e in ev)
             {
-                double x = TX(e.t, now), age = (now - e.t).TotalSeconds; if (x < 0) continue;
-                double k = age < 2 ? 1 : 0.55; Vc(x, 64, e.c, k); Vc(x, H - 34, e.c, k * 0.2);
-                L(e.src, (float)x + 3, 64 + (float)((e.t.Second % 4) * 13), e.c, 0);
+                double age = (now - e.t).TotalSeconds; if (age > 20) continue;
+                double x = -HW * 0.85 + HW * 1.7 * ((e.src.GetHashCode() & 0xffff) / 65535.0), k = age < 2 ? 1 : 0.35 + 0.5 * (1 - age / 20);
+                Vk(x, -TR, ZA(age), e.c, k * 0.3); Vk(x, Yh(0.9), ZA(age), e.c, k);
             }
-            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1);
+            GL.glLineWidth(3); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            foreach (var e in ev) { double age = (now - e.t).TotalSeconds; if (age < 10) LW(7, -HW * 0.85 + HW * 1.7 * ((e.src.GetHashCode() & 0xffff) / 65535.0), Yh(0.9), ZA(age), e.src, e.c, 2, -14); }
         }
-        if (G("Состояния"))
+        // 8 Состояния — 4 дорожки вдоль грани, светятся, пока состояние «да»
+        if (G(GRAM[8]))
         {
             var rows = new[] { new object[] { "st_andrey", "Андрей снаружи", Color.FromArgb(120, 255, 170) }, new object[] { "st_boiler", "бойлер", Color.FromArgb(255, 120, 80) },
                 new object[] { "st_locked", "XPS заблокирован", Color.FromArgb(170, 150, 255) }, new object[] { "st_vpn", "VPN", Color.FromArgb(90, 200, 255) } };
+            WallBegin(8);
             for (int r = 0; r < rows.Length; r++)
             {
-                var l = S((string)rows[r][0]); var c = (Color)rows[r][2]; double y = H - 36 - r * 9;
-                for (int i = 0; i + 1 < l.Count; i++) if (l[i].v > 0.5) { double xa = Math.Max(0, TX(l[i].t, now)), xb = TX(l[i + 1].t, now); Vc(xa, y, c, 0.7); Vc(xb, y, c, 0.7); Vc(xb, y - 6, c, 0.7); Vc(xa, y - 6, c, 0.7); }
-                bool onNow = l.Count > 0 && l[l.Count - 1].v > 0.5;
-                L((string)rows[r][1] + (onNow ? " · да" : " · нет"), W - 4, (float)y - 10, onNow ? c : Color.FromArgb(150, 150, 150), 1);   // справа: слева колонка ауры
+                var l = Sr((string)rows[r][0]); var c = (Color)rows[r][2]; double x0 = -HW + 2 * HW * r / 4 + 0.012, x1 = -HW + 2 * HW * (r + 1) / 4 - 0.012, y = -TR + 0.01;
+                for (int j = 0; j + 1 < l.Count; j++)
+                {
+                    double a0 = (now - l[j].t).TotalSeconds, a1 = (now - l[j + 1].t).TotalSeconds; if (a0 > 20 || l[j].v < 0.5) continue; double k = 0.25 + 0.55 * (1 - a0 / 20);
+                    Vk(x0, y, ZA(a0), c, k); Vk(x1, y, ZA(a0), c, k); Vk(x1, y, ZA(a1), c, k); Vk(x0, y, ZA(a1), c, k);
+                }
             }
-            Flush(0x0007);
+            Flush(0x0007); WallEnd();
+            for (int r = 0; r < rows.Length; r++)
+            {
+                var l = Sr((string)rows[r][0]); bool on = l.Count > 0 && l[l.Count - 1].v > 0.5;
+                LW(8, -HW + 2 * HW * (r + 0.5) / 4, -TR + 0.06 + (r % 2) * 0.07, 0, (string)rows[r][1] + (on ? " · да" : " · нет"), on ? (Color)rows[r][2] : Color.FromArgb(140, 140, 140), 2, -8);
+            }
         }
-        if (G("Потоки"))
+        // 9 Потоки — частицы летят вдаль, скорость ∝ log объёма
+        if (G(GRAM[9]))
         {
             Dictionary<string, double> fl; lock (lk) fl = new Dictionary<string, double>(flows);
-            int r = 0;
+            WallBegin(9); int r = 0; var c = GCOL[9];
             foreach (var kv in fl)
             {
-                double y = 104 + r * 24, x0 = W * 0.40, x1 = W * 0.60, rate = kv.Value, sp = Math.Log10(1 + rate / 1024) * 60;  // px/с
+                double x = -HW + 2 * HW * (r + 0.5) / Math.Max(1, fl.Count), rate = kv.Value, sp = Math.Log10(1 + rate / 1024) * 1.2;   // с «пути» за с
                 List<double> ps; if (!particles.TryGetValue(kv.Key, out ps)) particles[kv.Key] = ps = new List<double>();
-                for (int i = 0; i < ps.Count; i++) ps[i] += sp * dt;
-                ps.RemoveAll(p => p > x1 - x0);
+                for (int j = 0; j < ps.Count; j++) ps[j] += sp * dt;
+                ps.RemoveAll(p => p > 20);
                 if (rate > 1 && rnd.NextDouble() < Math.Min(0.9, Math.Log10(1 + rate / 1024) / 4)) ps.Add(0);
-                var c = GCOL[9];
-                foreach (var p in ps) { Vc(x0 + p, y, c, 0.9); Vc(x0 + p - Math.Min(18, sp * 0.15), y, c, 0.1); }
-                Vc(x0, y + 5, c, 0.12); Vc(x1, y + 5, c, 0.12);
-                string v = rate > 1048576 ? F(rate / 1048576, "0.##") + " МБ/с" : F(rate / 1024, "0.#") + " КБ/с";
-                L(kv.Key + " " + v, (float)(x0 + x1) / 2, (float)y - 15, c, 2);   // над дорожкой: слева колонка ауры
+                foreach (var p in ps) { double k = 0.9 * (1 - p / 20) + 0.1; Vk(x, -TR + 0.04, ZA(p), c, k); Vk(x, -TR + 0.04, ZA(Math.Max(0, p - 0.25 - sp * 0.1)), c, k * 0.1); }
+                Vk(x, -TR + 0.005, 0, c, 0.15); Vk(x, -TR + 0.005, -TD, c, 0.03);
                 r++;
             }
-            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1);
+            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            r = 0;
+            foreach (var kv in fl)
+            {
+                string v = kv.Value > 1048576 ? F(kv.Value / 1048576, "0.##") + " МБ/с" : F(kv.Value / 1024, "0.#") + " КБ/с";
+                LW(9, -HW + 2 * HW * (r + 0.5) / Math.Max(1, fl.Count), -TR + 0.07 + (r % 2) * 0.08, 0, kv.Key + " " + v, c, 2, -8); r++;
+            }
         }
-        // легенда грамматик: ■ включено, □ выключено (переключатели — пресеты PTZ во Frigate)
-        float lxp = 0; var parts = new List<Label>();
+    }
+
+    // легенда грамматик: ■ включено, □ выключено (переключатели — пресеты PTZ во Frigate)
+    static void Legend()
+    {
+        var parts = new List<Label>();
         for (int i = 0; i < GRAM.Length; i++) parts.Add(new Label { s = (G(GRAM[i]) ? "■ " : "□ ") + GRAM[i], c = G(GRAM[i]) ? GCOL[i] : Color.FromArgb(140, 140, 140) });
-        legendParts = parts; lxp++;
+        legendParts = parts;
     }
     static List<Label> legendParts = new List<Label>();
 
@@ -880,25 +850,13 @@ static class Aurora3D
                     lock (lk) { yaw += vYaw * dt * 1.2; pitch = Math.Max(-1.2, Math.Min(1.2, pitch + vPitch * dt * 0.8)); zoom = Math.Max(0.4, Math.Min(3, zoom * Math.Exp(vZoom * dt))); }
                     List<Slice> hs; float[,] dist;
                     lock (lk) { hs = new List<Slice>(hist); dist = frontDist; }
-                    labels.Clear(); tunM = null;
+                    labels.Clear();
                     GL.glClearColor(0, 0, 0, 0); GL.glClear(0x4000 | 0x100);
-                    if (haveInput && G("Сигнал")) DrawWaterfall(hs, dist, now);
-                    if (haveInput && (G("Вектор") || G("Направления"))) DrawTunnel(hs, now, G("Вектор"));
-                    if (G("Направления")) DrawDirections(now);
-                    if (G("Наборы")) DrawSets(now);
-                    Draw2D(now, dt);
-                    GL.glFinish();
-                    GL.glReadPixels(0, 0, W, H, 0x80E1, 0x1401, px);
-                    for (int y = 0; y < H; y++)
-                    {
-                        int si = (H - 1 - y) * W * 4, di = y * W * 4;
-                        for (int x = 0; x < W; x++, si += 4, di += 4)
-                        {
-                            int b = px[si], g = px[si + 1], r = px[si + 2], a = Math.Max(r, Math.Max(g, b));
-                            if (a == 0) { outb[di] = outb[di + 1] = outb[di + 2] = outb[di + 3] = 0; continue; }
-                            int ia = a << 8; outb[di] = unpm[ia + b]; outb[di + 1] = unpm[ia + g]; outb[di + 2] = unpm[ia + r]; outb[di + 3] = (byte)(a * 200 / 255);
-                        }
-                    }
+                    DrawAll(hs, dist, now, dt);
+                    Legend();
+                    // второй проход на GPU (шейдер): альфа = максимум канала, «распремножение», переворот строк —
+                    // раньше это был цикл по 518 тыс. пикселей на CPU (~8 мс на кадр); теперь кадр читается готовым
+                    GL.PostPass(outb);
                     var h = GCHandle.Alloc(outb, GCHandleType.Pinned);
                     try
                     {
@@ -942,9 +900,60 @@ static class Aurora3D
     }
 }
 
-// ---------- OpenGL 1.x + FBO (EXT) через P/Invoke ----------
+// ---------- OpenGL 1.x + FBO (EXT) + шейдер второго прохода через P/Invoke ----------
 static class GL
 {
+    [DllImport("opengl32.dll")] static extern void glGenTextures(int n, out uint t);
+    [DllImport("opengl32.dll")] static extern void glBindTexture(uint target, uint t);
+    [DllImport("opengl32.dll")] static extern void glTexImage2D(uint target, int level, int ifmt, int w, int h, int border, uint fmt, uint type, IntPtr data);
+    [DllImport("opengl32.dll")] static extern void glTexParameteri(uint target, uint p, int v);
+    [DllImport("opengl32.dll")] static extern void glBegin(uint mode);
+    [DllImport("opengl32.dll")] static extern void glEnd();
+    [DllImport("opengl32.dll")] static extern void glTexCoord2f(float s, float t);
+    [DllImport("opengl32.dll")] static extern void glVertex2f(float x, float y);
+    delegate uint CreateShaderFn(uint type);
+    delegate void ShaderSourceFn(uint sh, int n, [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string[] src, int[] len);
+    delegate void UIntFn(uint x);
+    delegate void GetShaderivFn(uint sh, uint p, out int v);
+    delegate void InfoLogFn(uint sh, int max, out int len, System.Text.StringBuilder log);
+    delegate uint CreateProgramFn();
+    delegate void AttachFn(uint p, uint sh);
+    delegate int UniformLocFn(uint p, string name);
+    delegate void Uniform1iFn(int loc, int v);
+    delegate void FbTex2DFn(uint target, uint attach, uint textarget, uint tex, int level);
+    static uint fbo1, fbo2, tex1, tex2, prog; static int W_, H_;
+    static BindFn bindFb;
+    static uint Shader(uint type, string src)
+    {
+        uint sh = Fn<CreateShaderFn>("glCreateShader")(type);
+        Fn<ShaderSourceFn>("glShaderSource")(sh, 1, new[] { src }, null);
+        Fn<UIntFn>("glCompileShader")(sh);
+        int ok; Fn<GetShaderivFn>("glGetShaderiv")(sh, 0x8B81, out ok);
+        if (ok == 0) { var sb = new System.Text.StringBuilder(2048); int l; Fn<InfoLogFn>("glGetShaderInfoLog")(sh, 2048, out l, sb); throw new Exception("шейдер: " + sb); }
+        return sh;
+    }
+    static uint Tex(int w, int h)
+    {
+        uint t; glGenTextures(1, out t); glBindTexture(0x0DE1, t);
+        glTexImage2D(0x0DE1, 0, 0x8058, w, h, 0, 0x1908, 0x1401, IntPtr.Zero);
+        glTexParameteri(0x0DE1, 0x2801, 0x2600); glTexParameteri(0x0DE1, 0x2800, 0x2600);   // GL_NEAREST: 1:1, без размытия
+        return t;
+    }
+    // второй проход: сцена (текстура 1) → шейдер → текстура 2 → glReadPixels в готовый буфер (сверху вниз, прямая альфа)
+    public static void PostPass(byte[] outb)
+    {
+        glDisable(0x0BE2); bindFb(0x8D40, fbo2); glViewport(0, 0, W_, H_);
+        glMatrixMode(0x1701); glLoadMatrixf(Id()); glMatrixMode(0x1700); glLoadMatrixf(Id());
+        Fn<UIntFn>("glUseProgram")(prog); glBindTexture(0x0DE1, tex1);
+        glBegin(0x0007);
+        glTexCoord2f(0, 1); glVertex2f(-1, -1); glTexCoord2f(1, 1); glVertex2f(1, -1);
+        glTexCoord2f(1, 0); glVertex2f(1, 1); glTexCoord2f(0, 0); glVertex2f(-1, 1);
+        glEnd();
+        Fn<UIntFn>("glUseProgram")(0);
+        glReadPixels(0, 0, W_, H_, 0x80E1, 0x1401, outb);
+        bindFb(0x8D40, fbo1); glEnable(0x0BE2);
+    }
+    static float[] Id() { var m = new float[16]; m[0] = m[5] = m[10] = m[15] = 1; return m; }
     [StructLayout(LayoutKind.Sequential)]
     struct PFD
     {
@@ -980,6 +989,10 @@ static class GL
     [DllImport("opengl32.dll")] public static extern void glPushMatrix();
     [DllImport("opengl32.dll")] public static extern void glPopMatrix();
     [DllImport("opengl32.dll")] public static extern void glTranslatef(float x, float y, float z);
+    [DllImport("opengl32.dll")] public static extern void glRotatef(float a, float x, float y, float z);
+    delegate void BlendColorFn(float r, float g, float b, float a);
+    static BlendColorFn blendColor;
+    public static void BlendColor(float r, float g, float b, float a) { if (blendColor == null) blendColor = Fn<BlendColorFn>("glBlendColor"); blendColor(r, g, b, a); }
     [DllImport("opengl32.dll")] public static extern void glFogi(uint p, int v);
     [DllImport("opengl32.dll")] public static extern void glFogf(uint p, float v);
     [DllImport("opengl32.dll")] public static extern void glFogfv(uint p, float[] v);
@@ -1002,12 +1015,21 @@ static class GL
         IntPtr ctx = wglCreateContext(hdc);
         if (ctx == IntPtr.Zero || !wglMakeCurrent(hdc, ctx)) throw new Exception("контекст OpenGL не создан");
         Renderer = Marshal.PtrToStringAnsi(glGetString(0x1F01)) + " / " + Marshal.PtrToStringAnsi(glGetString(0x1F02));
-        const uint FB = 0x8D40, RB = 0x8D41; uint fbo, rc, rd;
-        Fn<GenFn>("glGenFramebuffersEXT")(1, out fbo); Fn<BindFn>("glBindFramebufferEXT")(FB, fbo);
-        Fn<GenFn>("glGenRenderbuffersEXT")(1, out rc); Fn<BindFn>("glBindRenderbufferEXT")(RB, rc);
-        Fn<StorageFn>("glRenderbufferStorageEXT")(RB, 0x8058, w, h); Fn<AttachRbFn>("glFramebufferRenderbufferEXT")(FB, 0x8CE0, RB, rc);
+        const uint FB = 0x8D40, RB = 0x8D41; uint rd; W_ = w; H_ = h;
+        bindFb = Fn<BindFn>("glBindFramebufferEXT"); var fbTex = Fn<FbTex2DFn>("glFramebufferTexture2DEXT");
+        // FBO 2 — результат второго прохода
+        tex2 = Tex(w, h); Fn<GenFn>("glGenFramebuffersEXT")(1, out fbo2); bindFb(FB, fbo2); fbTex(FB, 0x8CE0, 0x0DE1, tex2, 0);
+        // FBO 1 — сцена: цвет в текстуру (её читает шейдер), глубина — renderbuffer
+        tex1 = Tex(w, h); Fn<GenFn>("glGenFramebuffersEXT")(1, out fbo1); bindFb(FB, fbo1); fbTex(FB, 0x8CE0, 0x0DE1, tex1, 0);
         Fn<GenFn>("glGenRenderbuffersEXT")(1, out rd); Fn<BindFn>("glBindRenderbufferEXT")(RB, rd);
         Fn<StorageFn>("glRenderbufferStorageEXT")(RB, 0x81A6, w, h); Fn<AttachRbFn>("glFramebufferRenderbufferEXT")(FB, 0x8D00, RB, rd);
+        glBindTexture(0x0DE1, 0);
+        uint vs = Shader(0x8B31, "varying vec2 uv; void main(){ uv = gl_MultiTexCoord0.xy; gl_Position = gl_Vertex; }");
+        uint fs = Shader(0x8B30, "uniform sampler2D t; varying vec2 uv; void main(){ vec4 c = texture2D(t, uv); float a = max(c.r, max(c.g, c.b));" +
+            " gl_FragColor = a > 0.0 ? vec4(c.rgb / a, a * 0.784) : vec4(0.0); }");
+        prog = Fn<CreateProgramFn>("glCreateProgram")(); Fn<AttachFn>("glAttachShader")(prog, vs); Fn<AttachFn>("glAttachShader")(prog, fs);
+        Fn<UIntFn>("glLinkProgram")(prog);
+        Fn<UIntFn>("glUseProgram")(prog); Fn<Uniform1iFn>("glUniform1i")(Fn<UniformLocFn>("glGetUniformLocation")(prog, "t"), 0); Fn<UIntFn>("glUseProgram")(0);
         glEnable(0x0BE2); glBlendFunc(1, 1);
         glDisable(0x0B71);
         glEnable(0x0B10);
