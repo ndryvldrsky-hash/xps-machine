@@ -521,7 +521,11 @@ static class Aurora3D
     static bool inside = true;
     static double TR { get { return inside ? 0.55 : 1.0; } }
     static double HW { get { return TR * Math.Tan(Math.PI / 10); } }
-    const double TD = 6.0, HMAX = 0.62;
+    const double TD = 6.0;
+    // «Наизнанку» лучи данных длиннее и уходят за внешний контур (просьба пользователя), а названия/подписи/контур
+    // стоят на прежнем радиусе LBR — данные проходят сквозь них к краям кадра
+    static double HMAX { get { return inside ? 1.6 : 0.62; } }
+    static double LBR { get { return inside ? 0.55 + 0.62 : TR; } }
     static float[] allM; static double spin; static readonly DateTime T0 = DateTime.Now;
     static float[] RotZ(double a) { var m = new float[16]; float c = (float)Math.Cos(a), s = (float)Math.Sin(a); m[0] = c; m[1] = s; m[4] = -s; m[5] = c; m[10] = m[15] = 1; return m; }
     // 21.09 ночь, по просьбе: тоннель НАЕЗЖАЕТ — «сейчас» рождается в глубине (z = −TD) и летит на зрителя, к кромке (z = 0)
@@ -537,9 +541,37 @@ static class Aurora3D
     static double Yh(double h) { return -TR + Math.Max(0, Math.Min(1, h)) * HMAX; }
     static double N01(double v, double lo, double hi) { return double.IsNaN(v) ? 0 : Math.Max(0, Math.Min(1, (v - lo) / (hi - lo))); }
     // подпись в координатах грани i
+    // Подписи значений и устройств. «Наизнанку» — лучами (просьба пользователя): текстура в плоскости кромки снаружи,
+    // в полосе своих данных (x), тянется от столба наружу продолжением луча; на левой половине экрана развёрнута, чтобы
+    // читалась к центру. Сверху и снизу лучи могут уходить за кадр — так задумано. В обычной трубе — прежние 2D-подписи.
+    struct RayLabel { public int i; public double x; public string s; public Color c; }
+    static readonly List<RayLabel> rays = new List<RayLabel>();
+    static Font labelFont;
+    static void DrawRays()
+    {
+        if (rays.Count == 0) return;
+        var byLane = new Dictionary<string, int>();
+        GL.glBlendFunc(0x0302, 1);
+        foreach (var r in rays)
+        {
+            string lane = r.i + "|" + Math.Round(r.x, 3); int k; byLane.TryGetValue(lane, out k); byLane[lane] = k + 1;   // в одной полосе — друг за другом
+            var tb = TextBmp(r.s, r.c, labelFont, StringFormat.GenericTypographic); uint tx = TexFor(r.c.ToArgb() + "|" + r.s, tb);
+            double h = 0.05, len = h * tb.Width / tb.Height, r0 = LBR + 0.13 + k * 0.02, gap = 0.04;
+            double off = 0; foreach (var q in rays) { if (q.Equals(r)) break; if (q.i == r.i && Math.Abs(q.x - r.x) < 1e-3) off += 0.05 * TextBmp(q.s, q.c, labelFont, StringFormat.GenericTypographic).Width / (double)TextBmp(q.s, q.c, labelFont, StringFormat.GenericTypographic).Height + gap; }
+            double a = r0 + off, b = a + len, x0 = r.x - h / 2, x1 = r.x + h / 2;
+            double outDir = -Math.PI / 2 + WallAng(r.i) + spin;           // направление «наружу» этой грани на экране
+            bool flip = Math.Cos(outDir) < -0.05;
+            WallBeginPlain(r.i);
+            // вершины: начало-низ, конец-низ, конец-верх, начало-верх строки; верх букв — к +x грани (иначе зеркально)
+            if (!flip) GL.TexQuad(tx, 0.95f, x0, -a, 0, x0, -b, 0, x1, -b, 0, x1, -a, 0);   // читается наружу
+            else GL.TexQuad(tx, 0.95f, x1, -b, 0, x1, -a, 0, x0, -a, 0, x0, -b, 0);         // читается к центру
+            WallEnd();
+        }
+        GL.glBlendFunc(1, 1);
+    }
     static void LW(int i, double x, double y, double z, string s, Color c, int align, float dy)
     {
-        if (inside) y = -2 * TR - y;
+        if (inside) { rays.Add(new RayLabel { i = i, x = x, s = s, c = c }); return; }
         double a = WallAng(i), ca = Math.Cos(a), sa = Math.Sin(a); float px, py;
         if (Proj(allM, x * ca - y * sa, x * sa + y * ca, z, 0, 0, W, H, out px, out py)) L(s, px, py + dy * SCF, c, align);
     }
@@ -618,10 +650,10 @@ static class Aurora3D
             if (ti >= 0) { tt = tick0.AddSeconds(-5 * ti); age = (now - tt).TotalSeconds; if (age > 20) continue; }
             double z = ZA(age), k = ti < 0 ? 0.45 : 0.3 * (1 - age / 20) + 0.06;
             for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(cr * Math.Cos(a0), cr * Math.Sin(a0), z, cAx, k); Vk(cr * Math.Cos(a1), cr * Math.Sin(a1), z, cAx, k); }
-            if (ti >= 0) { float px, py; if (Proj(allM, 0, inside ? TR + HMAX + 0.05 : TR, z, 0, 0, W, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px, py - 14 * SCF, cAx, 2); }
+            if (ti >= 0) { float px, py; if (Proj(allM, 0, inside ? LBR + 0.05 : TR, z, 0, 0, W, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px, py - 14 * SCF, cAx, 2); }
         }
         for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(cr * Math.Cos(a0), cr * Math.Sin(a0), 0, cAx, 0.3); Vk(cr * Math.Cos(a1), cr * Math.Sin(a1), 0, cAx, 0.3); }
-        if (inside) { double co = (TR + HMAX) / Math.Cos(Math.PI / n); for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(co * Math.Cos(a0), co * Math.Sin(a0), 0, cAx, 0.1); Vk(co * Math.Cos(a1), co * Math.Sin(a1), 0, cAx, 0.1); } }
+        if (inside) { double co = LBR / Math.Cos(Math.PI / n); for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(co * Math.Cos(a0), co * Math.Sin(a0), 0, cAx, 0.1); Vk(co * Math.Cos(a1), co * Math.Sin(a1), 0, cAx, 0.1); } }
         Flush(0x0001);
         // названия грамматик — снаружи многогранника, у внешней кромки своей грани, вдоль её ребра (просьба пользователя):
         // текстура в плоскости кромки (z = 0), верх букв — к центру; крутится вместе с многогранником
@@ -631,8 +663,8 @@ static class Aurora3D
             bool on = G(GRAM[i]); var col = on ? GCOL[i] : Color.FromArgb(120, 120, 120);
             string name = GRAM[i] + (on ? "" : " · выкл");
             var tb = TextBmp(name, col, bigFont, StringFormat.GenericTypographic); uint tx = TexFor("big|" + col.ToArgb() + "|" + name, tb);
-            double asp = (double)tb.Width / tb.Height, hgt = Math.Min(0.075, 2 * (inside ? (TR + HMAX) * Math.Tan(Math.PI / n) : HW) * 0.95 / asp), len = hgt * asp,
-                yt = -(inside ? TR + HMAX : TR) - 0.02, yb = yt - hgt;
+            double asp = (double)tb.Width / tb.Height, hgt = Math.Min(0.075, 2 * (inside ? LBR * Math.Tan(Math.PI / n) : HW) * 0.95 / asp), len = hgt * asp,
+                yt = -LBR - 0.02, yb = yt - hgt;
             // грань в верхней половине экрана — подпись повёрнута на 180°, чтобы читалась, а не вверх ногами
             bool up = Math.Sin(-Math.PI / 2 + WallAng(i) + spin) > 0.05;
             WallBeginPlain(i);
@@ -905,7 +937,7 @@ static class Aurora3D
         GL.Init(W, H);
         Log("OpenGL: " + GL.Renderer);
         var outb = new byte[W * H * 5 / 2];   // yuva420p: Y, U, V, A
-        var font = new Font("Consolas", 12f * SCF, FontStyle.Bold, GraphicsUnit.Pixel);
+        var font = new Font("Consolas", 12f * SCF, FontStyle.Bold, GraphicsUnit.Pixel); labelFont = font;
         var shadow = new SolidBrush(Color.FromArgb(200, 0, 0, 0));
         var fmt = StringFormat.GenericTypographic;
         DateTime prev = DateTime.Now;
@@ -928,6 +960,7 @@ static class Aurora3D
                     GL.glClearColor(0, 0, 0, 0); GL.glClear(0x4000 | 0x100);
                     double tA = sw.Elapsed.TotalMilliseconds;
                     DrawAll(hs, dist, now, dt);
+                    DrawRays(); rays.Clear();
                     DrawPerimeterClock(now);
                     Legend(); GL.glFinish(); double tB = sw.Elapsed.TotalMilliseconds; stDraw += tB - tA;
                     // подписи: GDI+ растрирует строку ОДИН раз (кэш), дальше она — текстура на видеокарте
