@@ -39,7 +39,7 @@ static class Aurora3D
     // ---------- параметры ----------
     const int W = 960, H = 540;
     const int IW = 160, IH = 90;
-    const int SLICES = 100; const double SLICE_SEC = 0.2;
+    const int SLICES = 200; const double SLICE_SEC = 0.1;   // срез на каждый кадр анализа (10 к/с), 20 с в глубину
     const int YBINS = 48, UVB = 48;
     const double TAXIS = 80;                                   // ширина подвижной оси времени, с (как у прежних графиков)
     static readonly string DIR = @"W:\tools\aurora3d\";
@@ -102,7 +102,12 @@ static class Aurora3D
     static readonly Dictionary<string, double> flows = new Dictionary<string, double>();
 
     // ---------- кадр: история для водопада/тоннеля ----------
-    class Slice { public DateTime t; public float[] mean = new float[IW]; public float[,] uv = new float[UVB, UVB]; }
+    class Slice
+    {
+        public DateTime t; public float[] mean = new float[IW]; public float[,] uv = new float[UVB, UVB];
+        // вершины среза строятся один раз (z = 0); вглубь срез уводит glTranslatef, затухание — туман OpenGL
+        public float[] wfV, wfC, tnV, tnC;
+    }
     static readonly LinkedList<Slice> hist = new LinkedList<Slice>();
     static float[,] frontDist = new float[IW, YBINS];
     static volatile bool haveInput = false;
@@ -509,17 +514,25 @@ static class Aurora3D
         var P = Persp(48, (double)W / H, 0.1, 40); var Vw = LookAt(0, 1.45, 2.9 / zoom, 0, 0.3, -1.6); var Mo = Orbit(0, 0.4, -2); var M = Mul(P, Mul(Vw, Mo));
         Scene3D(P, Vw, Mo, 0, 0, W, H);
         const double X0 = -1.55, XW = 3.1;
+        double d0 = Math.Sqrt(1.15 * 1.15 + (2.9 / zoom) * (2.9 / zoom));
+        Fog(d0 * 0.95, d0 + WF_D * 1.15);
         foreach (var s in hs)
         {
             double age = (now - s.t).TotalSeconds; if (age > 20) continue;
-            double z = -age / 20 * WF_D, k = 0.9 * (1 - age / 20) + 0.08;
-            for (int x = 0; x + 1 < IW; x++)
+            if (s.wfV == null)
             {
-                V(X0 + XW * x / (IW - 1), s.mean[x] / 255.0, z, 0.25 * k, 0.82 * k, 1 * k);
-                V(X0 + XW * (x + 1) / (IW - 1), s.mean[x + 1] / 255.0, z, 0.25 * k, 0.82 * k, 1 * k);
+                for (int x = 0; x + 1 < IW; x++)
+                {
+                    V(X0 + XW * x / (IW - 1), s.mean[x] / 255.0, 0, 0.25 * 0.95, 0.82 * 0.95, 0.95);
+                    V(X0 + XW * (x + 1) / (IW - 1), s.mean[x + 1] / 255.0, 0, 0.25 * 0.95, 0.82 * 0.95, 0.95);
+                }
+                s.wfV = vb.ToArray(); s.wfC = cb.ToArray(); vb.Clear(); cb.Clear();
             }
+            GL.glPushMatrix(); GL.glTranslatef(0, 0, (float)(-age / 20 * WF_D));
+            GL.glVertexPointer(3, 0x1406, 0, s.wfV); GL.glColorPointer(4, 0x1406, 0, s.wfC); GL.glDrawArrays(0x0001, 0, s.wfV.Length / 3);
+            GL.glPopMatrix();
         }
-        Flush(0x0001);
+        GL.glDisable(0x0B60);
         if (dist != null)
         {
             for (int x = 0; x < IW; x++) for (int b = 0; b < YBINS; b++)
@@ -544,6 +557,12 @@ static class Aurora3D
         float lx, ly; if (Proj(M, X0, 1.08, 0, 0, 0, W, H, out lx, out ly)) L("Сигнал · Y 0–255, вглубь — время", lx, ly - 8, cSig, 0);
     }
 
+    // туман OpenGL (линейный, к чёрному): при аддитивном свечении чёрный = прозрачный — срезы гаснут с глубиной на GPU
+    static void Fog(double start, double end)
+    {
+        GL.glEnable(0x0B60); GL.glFogi(0x0B65, 0x2601); GL.glFogf(0x0B63, (float)start); GL.glFogf(0x0B64, (float)end);
+        GL.glFogfv(0x0B66, new float[] { 0, 0, 0, 0 });
+    }
     static void HueColor(double u, double v, out double r, out double g, out double b)
     {
         double Y = 150, U = u * 32 * 3, Vv = v * 32 * 3;
@@ -556,19 +575,28 @@ static class Aurora3D
         var P = Persp(58, 1, 0.1, 40); var Vw = LookAt(0.25, 0.35, 1.9 / zoom, 0, 0, -2.5); var Mo = Orbit(0, 0, -3); var M = Mul(P, Mul(Vw, Mo)); tunM = M;
         Scene3D(P, Vw, Mo, tunVx, 0, H, H);
         if (!points) return;
+        GL.glPointSize(2);
+        Fog(1.9 / zoom * 0.95, 1.9 / zoom + TN_D * 1.1);
         foreach (var s in hs)
         {
             double age = (now - s.t).TotalSeconds; if (age > 20) continue;
-            double z = -age / 20 * TN_D, fade = 1 - age / 20;
-            for (int i = 0; i < UVB; i++) for (int j = 0; j < UVB; j++)
-                {
-                    float n = s.uv[i, j]; if (n <= 0) continue;
-                    double u = (i + 0.5) / UVB * 2 - 1, v = (j + 0.5) / UVB * 2 - 1, r, g, b; HueColor(u, v, out r, out g, out b);
-                    double k = Math.Min(0.9, 0.1 + n / 80.0) * (0.12 + 0.88 * fade);
-                    V(u, v, z, r * k, g * k, b * k);
-                }
+            if (s.tnV == null)
+            {
+                for (int i = 0; i < UVB; i++) for (int j = 0; j < UVB; j++)
+                    {
+                        float n = s.uv[i, j]; if (n <= 0) continue;
+                        double u = (i + 0.5) / UVB * 2 - 1, v = (j + 0.5) / UVB * 2 - 1, r, g, b; HueColor(u, v, out r, out g, out b);
+                        double k = Math.Min(0.9, 0.1 + n / 40.0);   // срез теперь из 1 кадра, а не из 2 — порог вдвое ниже
+                        V(u, v, 0, r * k, g * k, b * k);
+                    }
+                s.tnV = vb.ToArray(); s.tnC = cb.ToArray(); vb.Clear(); cb.Clear();
+            }
+            if (s.tnV.Length == 0) continue;
+            GL.glPushMatrix(); GL.glTranslatef(0, 0, (float)(-age / 20 * TN_D));
+            GL.glVertexPointer(3, 0x1406, 0, s.tnV); GL.glColorPointer(4, 0x1406, 0, s.tnC); GL.glDrawArrays(0x0000, 0, s.tnV.Length / 3);
+            GL.glPopMatrix();
         }
-        GL.glPointSize(2); Flush(0x0000);
+        GL.glDisable(0x0B60);
         const double pure = 118.0;
         var tick0 = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, now.Second / 5 * 5);
         for (int ti = -1; ti <= 4; ti++)
@@ -949,6 +977,12 @@ static class GL
     [DllImport("opengl32.dll")] public static extern void glDrawArrays(uint mode, int first, int count);
     [DllImport("opengl32.dll")] public static extern void glReadPixels(int x, int y, int w, int h, uint fmt, uint type, byte[] data);
     [DllImport("opengl32.dll")] public static extern void glFinish();
+    [DllImport("opengl32.dll")] public static extern void glPushMatrix();
+    [DllImport("opengl32.dll")] public static extern void glPopMatrix();
+    [DllImport("opengl32.dll")] public static extern void glTranslatef(float x, float y, float z);
+    [DllImport("opengl32.dll")] public static extern void glFogi(uint p, int v);
+    [DllImport("opengl32.dll")] public static extern void glFogf(uint p, float v);
+    [DllImport("opengl32.dll")] public static extern void glFogfv(uint p, float[] v);
     delegate void GenFn(int n, out uint id);
     delegate void BindFn(uint target, uint id);
     delegate void StorageFn(uint target, uint fmt, int w, int h);
