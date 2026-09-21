@@ -71,11 +71,11 @@ static class Aurora3D
     static void LoadToggles()
     {
         foreach (var n in GRAM) On[n] = true;
-        try { foreach (var l in File.ReadAllLines(DIR + "toggles.txt", Encoding.UTF8)) { var p = l.Split('='); if (p.Length == 2 && On.ContainsKey(p[0])) On[p[0]] = p[1].Trim() == "1"; } } catch { }
+        try { foreach (var l in File.ReadAllLines(DIR + "toggles.txt", Encoding.UTF8)) { var p = l.Split('='); if (p.Length == 2 && On.ContainsKey(p[0])) On[p[0]] = p[1].Trim() == "1"; if (p.Length == 2 && p[0] == "Наизнанку") inside = p[1].Trim() == "1"; } } catch { }
     }
     static void SaveToggles()
     {
-        try { lock (lk) File.WriteAllLines(DIR + "toggles.txt", GRAM.Select(n => n + "=" + (On[n] ? "1" : "0")).ToArray(), Encoding.UTF8); } catch { }
+        try { lock (lk) File.WriteAllLines(DIR + "toggles.txt", GRAM.Select(n => n + "=" + (On[n] ? "1" : "0")).Concat(new[] { "Наизнанку=" + (inside ? "1" : "0") }).ToArray(), Encoding.UTF8); } catch { }
     }
 
     // ---------- вид 3D-сцен (стрелки/зум PTZ) ----------
@@ -319,7 +319,7 @@ static class Aurora3D
     }
 
     // ---------- ONVIF (поддельный PTZ для кнопок во Frigate) ----------
-    static readonly string[] PRESETS = GRAM.Concat(new[] { "Всё включить", "Всё выключить", "Сброс вида" }).ToArray();
+    static readonly string[] PRESETS = GRAM.Concat(new[] { "Всё включить", "Всё выключить", "Сброс вида", "Наизнанку" }).ToArray();
     const string NS = "xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" " +
         "xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\" xmlns:tt=\"http://www.onvif.org/ver10/schema\"";
     const string VSP = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace", VSZ = "http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace";
@@ -402,6 +402,7 @@ static class Aurora3D
             else if (n == "Всё включить") foreach (var g in GRAM) On[g] = true;
             else if (n == "Всё выключить") foreach (var g in GRAM) On[g] = false;
             else if (n == "Сброс вида") { yaw = pitch = 0; zoom = 1; }
+            else if (n == "Наизнанку") inside = !inside;
         }
         SaveToggles(); Log("кнопка: " + n);
     }
@@ -515,20 +516,30 @@ static class Aurora3D
     // повёрнутая на свой угол (i·36°) вокруг оси взгляда. «Сейчас» рождается в глубине у центра и наезжает на зрителя,
     // у кромки (z = 0) — 20 с назад; кольца-метки ЧЧ:ММ:СС через 5 с летят на зрителя по всем граням. Выключенная грамматика — пустая грань.
     // Грань в своих координатах: x — поперёк грани [−HW, HW], y = −TR + h·HMAX — высота данных над гранью, z — время.
-    const double TR = 1.0, TD = 6.0, HMAX = 0.62;
-    static readonly double HW = TR * Math.Tan(Math.PI / 10);
+    // «Наизнанку» (пресет, по умолчанию вкл): труба выворачивается в столб — колонна уже (TR 0,55), данные граней растут
+    // из её стенок НАРУЖУ. Делается отражением каждой грани относительно её плоскости в матрице (WallBegin), код грамматик общий.
+    static bool inside = true;
+    static double TR { get { return inside ? 0.55 : 1.0; } }
+    static double HW { get { return TR * Math.Tan(Math.PI / 10); } }
+    const double TD = 6.0, HMAX = 0.62;
     static float[] allM; static double spin; static readonly DateTime T0 = DateTime.Now;
     static float[] RotZ(double a) { var m = new float[16]; float c = (float)Math.Cos(a), s = (float)Math.Sin(a); m[0] = c; m[1] = s; m[4] = -s; m[5] = c; m[10] = m[15] = 1; return m; }
     // 21.09 ночь, по просьбе: тоннель НАЕЗЖАЕТ — «сейчас» рождается в глубине (z = −TD) и летит на зрителя, к кромке (z = 0)
     static double ZA(double age) { return -TD + Math.Min(20, age) / 20 * TD; }
     static double WallAng(int i) { return i * 2 * Math.PI / GRAM.Length; }          // 0 — нижняя грань, дальше против часовой
-    static void WallBegin(int i) { GL.glPushMatrix(); GL.glRotatef((float)(WallAng(i) * 180 / Math.PI), 0, 0, 1); }
+    static void WallBegin(int i)
+    {
+        GL.glPushMatrix(); GL.glRotatef((float)(WallAng(i) * 180 / Math.PI), 0, 0, 1);
+        if (inside) { GL.glTranslatef(0, (float)(-2 * TR), 0); GL.glScalef(1, -1, 1); }   // y → −2·TR − y: данные наружу
+    }
+    static void WallBeginPlain(int i) { GL.glPushMatrix(); GL.glRotatef((float)(WallAng(i) * 180 / Math.PI), 0, 0, 1); }
     static void WallEnd() { GL.glPopMatrix(); }
     static double Yh(double h) { return -TR + Math.Max(0, Math.Min(1, h)) * HMAX; }
     static double N01(double v, double lo, double hi) { return double.IsNaN(v) ? 0 : Math.Max(0, Math.Min(1, (v - lo) / (hi - lo))); }
     // подпись в координатах грани i
     static void LW(int i, double x, double y, double z, string s, Color c, int align, float dy)
     {
+        if (inside) y = -2 * TR - y;
         double a = WallAng(i), ca = Math.Cos(a), sa = Math.Sin(a); float px, py;
         if (Proj(allM, x * ca - y * sa, x * sa + y * ca, z, 0, 0, W, H, out px, out py)) L(s, px, py + dy * SCF, c, align);
     }
@@ -607,9 +618,10 @@ static class Aurora3D
             if (ti >= 0) { tt = tick0.AddSeconds(-5 * ti); age = (now - tt).TotalSeconds; if (age > 20) continue; }
             double z = ZA(age), k = ti < 0 ? 0.45 : 0.3 * (1 - age / 20) + 0.06;
             for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(cr * Math.Cos(a0), cr * Math.Sin(a0), z, cAx, k); Vk(cr * Math.Cos(a1), cr * Math.Sin(a1), z, cAx, k); }
-            if (ti >= 0) { float px, py; if (Proj(allM, 0, TR, z, 0, 0, W, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px, py - 14 * SCF, cAx, 2); }
+            if (ti >= 0) { float px, py; if (Proj(allM, 0, inside ? TR + HMAX + 0.05 : TR, z, 0, 0, W, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px, py - 14 * SCF, cAx, 2); }
         }
         for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(cr * Math.Cos(a0), cr * Math.Sin(a0), 0, cAx, 0.3); Vk(cr * Math.Cos(a1), cr * Math.Sin(a1), 0, cAx, 0.3); }
+        if (inside) { double co = (TR + HMAX) / Math.Cos(Math.PI / n); for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(co * Math.Cos(a0), co * Math.Sin(a0), 0, cAx, 0.1); Vk(co * Math.Cos(a1), co * Math.Sin(a1), 0, cAx, 0.1); } }
         Flush(0x0001);
         // названия грамматик — снаружи многогранника, у внешней кромки своей грани, вдоль её ребра (просьба пользователя):
         // текстура в плоскости кромки (z = 0), верх букв — к центру; крутится вместе с многогранником
@@ -619,10 +631,11 @@ static class Aurora3D
             bool on = G(GRAM[i]); var col = on ? GCOL[i] : Color.FromArgb(120, 120, 120);
             string name = GRAM[i] + (on ? "" : " · выкл");
             var tb = TextBmp(name, col, bigFont, StringFormat.GenericTypographic); uint tx = TexFor("big|" + col.ToArgb() + "|" + name, tb);
-            double asp = (double)tb.Width / tb.Height, hgt = Math.Min(0.075, 2 * HW * 0.95 / asp), len = hgt * asp, yt = -cr * Math.Cos(Math.PI / n) - 0.02, yb = yt - hgt;
+            double asp = (double)tb.Width / tb.Height, hgt = Math.Min(0.075, 2 * (inside ? (TR + HMAX) * Math.Tan(Math.PI / n) : HW) * 0.95 / asp), len = hgt * asp,
+                yt = -(inside ? TR + HMAX : TR) - 0.02, yb = yt - hgt;
             // грань в верхней половине экрана — подпись повёрнута на 180°, чтобы читалась, а не вверх ногами
             bool up = Math.Sin(-Math.PI / 2 + WallAng(i) + spin) > 0.05;
-            WallBegin(i);
+            WallBeginPlain(i);
             if (!up) GL.TexQuad(tx, on ? 0.95f : 0.55f, -len / 2, yb, 0, len / 2, yb, 0, len / 2, yt, 0, -len / 2, yt, 0);
             else GL.TexQuad(tx, on ? 0.95f : 0.55f, len / 2, yt, 0, -len / 2, yt, 0, -len / 2, yb, 0, len / 2, yb, 0);
             WallEnd();
@@ -1040,6 +1053,8 @@ static class GL
     {
         glDisable(0x0BE2); glMatrixMode(0x1701); glLoadMatrixf(Id()); glMatrixMode(0x1700); glLoadMatrixf(Id());
         var at = Fn<ActiveTexFn>("glActiveTexture");
+        Bloom();
+        at(0x84C2); glBindTexture(0x0DE1, texB1);
         at(0x84C1); glBindTexture(0x0DE1, tex3); at(0x84C0); glBindTexture(0x0DE1, tex1);
         Fn<UIntFn>("glUseProgram")(progY); glPixelStorei(0x0D05, 1);
         var h = GCHandle.Alloc(outb, GCHandleType.Pinned);
@@ -1061,8 +1076,36 @@ static class GL
         }
         finally { h.Free(); }
         Fn<UIntFn>("glUseProgram")(0);
-        at(0x84C1); glBindTexture(0x0DE1, 0); at(0x84C0); glBindTexture(0x0DE1, 0);
+        at(0x84C2); glBindTexture(0x0DE1, 0); at(0x84C1); glBindTexture(0x0DE1, 0); at(0x84C0); glBindTexture(0x0DE1, 0);
         bindFb(0x8D40, fbo1); glViewport(0, 0, W_, H_); glEnable(0x0BE2);
+    }
+    static uint fboB1, fboB2, texB1, texB2, progDown, progBlur; static int bw, bh, locD;
+    delegate void Uniform1fFn(int loc, float v);
+    static uint TexLin(int w, int h)
+    {
+        uint t; glGenTextures(1, out t); glBindTexture(0x0DE1, t);
+        glTexImage2D(0x0DE1, 0, 0x8058, w, h, 0, 0x1908, 0x1401, IntPtr.Zero);
+        glTexParameteri(0x0DE1, 0x2801, 0x2601); glTexParameteri(0x0DE1, 0x2800, 0x2601);   // GL_LINEAR — для гаусса через линейную выборку
+        glTexParameteri(0x0DE1, 0x2802, 0x812F); glTexParameteri(0x0DE1, 0x2803, 0x812F);   // CLAMP_TO_EDGE
+        return t;
+    }
+    static uint Prog(uint vs, uint fs) { uint p = Fn<CreateProgramFn>("glCreateProgram")(); Fn<AttachFn>("glAttachShader")(p, vs); Fn<AttachFn>("glAttachShader")(p, fs); Fn<UIntFn>("glLinkProgram")(p); return p; }
+    static void FullQuad()
+    {
+        glBegin(0x0007); glTexCoord2f(0, 0); glVertex2f(-1, -1); glTexCoord2f(1, 0); glVertex2f(1, -1); glTexCoord2f(1, 1); glVertex2f(1, 1); glTexCoord2f(0, 1); glVertex2f(-1, 1); glEnd();
+    }
+    // ореол свечения: tex1 → ¼ (texB1) → гаусс Г → texB2 → гаусс В → texB1, и ещё раз для ширины
+    static void Bloom()
+    {
+        var use = Fn<UIntFn>("glUseProgram"); var u2 = Fn<Uniform2fFn>("glUniform2f");
+        bindFb(0x8D40, fboB1); glViewport(0, 0, bw, bh); use(progDown); glBindTexture(0x0DE1, tex1); FullQuad();
+        use(progBlur);
+        for (int it = 0; it < 2; it++)
+        {
+            bindFb(0x8D40, fboB2); u2(locD, 1f / bw, 0); glBindTexture(0x0DE1, texB1); FullQuad();
+            bindFb(0x8D40, fboB1); u2(locD, 0, 1f / bh); glBindTexture(0x0DE1, texB2); FullQuad();
+        }
+        use(0); glBindTexture(0x0DE1, 0);
     }
     static uint R8(int w, int h, FbTex2DFn fbTex, out uint fbo)
     {
@@ -1123,6 +1166,7 @@ static class GL
     [DllImport("opengl32.dll")] public static extern void glPopMatrix();
     [DllImport("opengl32.dll")] public static extern void glTranslatef(float x, float y, float z);
     [DllImport("opengl32.dll")] public static extern void glRotatef(float a, float x, float y, float z);
+    [DllImport("opengl32.dll")] public static extern void glScalef(float x, float y, float z);
     delegate void BlendColorFn(float r, float g, float b, float a);
     static BlendColorFn blendColor;
     public static void BlendColor(float r, float g, float b, float a) { if (blendColor == null) blendColor = Fn<BlendColorFn>("glBlendColor"); blendColor(r, g, b, a); }
@@ -1163,8 +1207,8 @@ static class GL
         uint vs = Shader(0x8B31, "varying vec2 uv; void main(){ uv = gl_MultiTexCoord0.xy; gl_Position = gl_Vertex; }");
         // yuva: итог = подписи поверх свечения (прямая альфа), BT.601 ограниченный диапазон; U/V — среднее 2x2 пикселей
         uint fy = Shader(0x8B30,
-            "uniform sampler2D g; uniform sampler2D l; uniform int mode; uniform vec2 px; varying vec2 uv;" +
-            "vec4 comp(vec2 t){ vec3 c = texture2D(g, t).rgb; float ag = max(c.r, max(c.g, c.b)) * 0.784; vec3 gp = c * 0.784;" +
+            "uniform sampler2D g; uniform sampler2D l; uniform sampler2D bl; uniform float bk; uniform int mode; uniform vec2 px; varying vec2 uv;" +
+            "vec4 comp(vec2 t){ vec3 c = min(texture2D(g, t).rgb + texture2D(bl, t).rgb * bk, vec3(1.0)); float ag = max(c.r, max(c.g, c.b)) * 0.784; vec3 gp = c * 0.784;" +
             " vec4 L = texture2D(l, t); float a = L.a + ag * (1.0 - L.a); vec3 pm = L.rgb + gp * (1.0 - L.a);" +
             " return a > 0.0 ? vec4(pm / a, a) : vec4(0.0); }" +
             "void main(){ vec4 c;" +
@@ -1176,10 +1220,25 @@ static class GL
             " else if (mode == 2) v = (128.0 + 112.0 * c.r - 93.786 * c.g - 18.214 * c.b) / 255.0;" +
             " else v = c.a;" +
             " gl_FragColor = vec4(v, 0.0, 0.0, 1.0); }");
+        // bloom: уменьшение в 4 раза (среднее 4 выборок) и гаусс 9 выборок через линейную фильтрацию, два прохода по две оси
+        bw = w / 4; bh = h / 4;
+        texB1 = TexLin(bw, bh); Fn<GenFn>("glGenFramebuffersEXT")(1, out fboB1); bindFb(FB, fboB1); fbTex(FB, 0x8CE0, 0x0DE1, texB1, 0);
+        texB2 = TexLin(bw, bh); Fn<GenFn>("glGenFramebuffersEXT")(1, out fboB2); bindFb(FB, fboB2); fbTex(FB, 0x8CE0, 0x0DE1, texB2, 0);
+        bindFb(FB, fbo1); glBindTexture(0x0DE1, 0);
+        progDown = Prog(vs, Shader(0x8B30, "uniform sampler2D t; uniform vec2 px; varying vec2 uv; void main(){ vec3 c = texture2D(t, uv + vec2(-px.x, -px.y)).rgb +" +
+            " texture2D(t, uv + vec2(px.x, -px.y)).rgb + texture2D(t, uv + vec2(-px.x, px.y)).rgb + texture2D(t, uv + vec2(px.x, px.y)).rgb; gl_FragColor = vec4(c * 0.25, 1.0); }"));
+        Fn<UIntFn>("glUseProgram")(progDown); Fn<Uniform2fFn>("glUniform2f")(Fn<UniformLocFn>("glGetUniformLocation")(progDown, "px"), 1f / w, 1f / h);
+        progBlur = Prog(vs, Shader(0x8B30, "uniform sampler2D t; uniform vec2 d; varying vec2 uv; void main(){ vec3 c = texture2D(t, uv).rgb * 0.2270270270;" +
+            " c += (texture2D(t, uv + d * 1.3846153846).rgb + texture2D(t, uv - d * 1.3846153846).rgb) * 0.3162162162;" +
+            " c += (texture2D(t, uv + d * 3.2307692308).rgb + texture2D(t, uv - d * 3.2307692308).rgb) * 0.0702702703; gl_FragColor = vec4(c, 1.0); }"));
+        locD = Fn<UniformLocFn>("glGetUniformLocation")(progBlur, "d");
+        Fn<UIntFn>("glUseProgram")(0);
         progY = Fn<CreateProgramFn>("glCreateProgram")(); Fn<AttachFn>("glAttachShader")(progY, vs); Fn<AttachFn>("glAttachShader")(progY, fy); Fn<UIntFn>("glLinkProgram")(progY);
         Fn<UIntFn>("glUseProgram")(progY);
         Fn<Uniform1iFn>("glUniform1i")(Fn<UniformLocFn>("glGetUniformLocation")(progY, "g"), 0);
         Fn<Uniform1iFn>("glUniform1i")(Fn<UniformLocFn>("glGetUniformLocation")(progY, "l"), 1);
+        Fn<Uniform1iFn>("glUniform1i")(Fn<UniformLocFn>("glGetUniformLocation")(progY, "bl"), 2);
+        Fn<Uniform1fFn>("glUniform1f")(Fn<UniformLocFn>("glGetUniformLocation")(progY, "bk"), 1.1f);   // сила ореола
         locMode = Fn<UniformLocFn>("glGetUniformLocation")(progY, "mode"); locPx = Fn<UniformLocFn>("glGetUniformLocation")(progY, "px");
         Fn<Uniform2fFn>("glUniform2f")(locPx, 1f / w, 1f / h);
         Fn<UIntFn>("glUseProgram")(0);
