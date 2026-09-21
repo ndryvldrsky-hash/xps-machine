@@ -119,6 +119,13 @@ base64, ровно один BOM), обратно — `xps_get.py`.
   потоке давал 0.61x, mediamtx рвал отстающую публикацию (-10053). Цена — ffmpeg ~19,5 % CPU (было ~9 %).
   `variant_push.ps1` масштабирует `overlay.png` под 720p `xps_cam`. Во Frigate: detect — `xps_sub`, запись — чистый
   `xps_cam`, аура только в просмотре (`XPS`, `XPS: 1080p`).
+- **Аврора 3D** (`aurora3d/aurora3d.cs` → `W:\tools\aurora3d\aurora3d.exe`, задача `Aurora3D` под rdpuser, сборка
+  `csc` из .NET Framework 4, C# 5): Сигнал «водопадом» и Вектор «тоннелем» рисует видеокарта (OpenGL 4.6 на NVIDIA GT 640M,
+  FBO через EXT), глубина — время 20 с с подвижными метками ЧЧ:ММ:СС и кольцами насыщенности на них. Вход — свой ffmpeg
+  из `xps_sub` → 160x90 yuv444p; выход — канал `\\.\pipe\aurora3d` (BGRA 960x540, прямая альфа, 10 к/с; файлом нельзя —
+  ~2 ТБ записи в сутки). `webcam_push.ps1` берёт канал входом [4], только если он есть в списке `\\.\pipe\` (Test-Path
+  может сам открыть канал) и нет `W:\ffmpeg\aurora3d_off.txt`; иначе — прежние 2D-скопы. Замер: 960x540, 20 тыс. линий —
+  2 мс рисование + 3 мс считывание; CPU aurora3d ~1 %, ffmpeg камеры 19,5 → 18 %. `aurora3d/gl_probe.cs` — пробник GL.
 - **Сторож TextInputHost** (`tools/tih_watchdog.ps1` → `W:\tools\`, задача `TextInputHostWatchdog` под rdpuser,
   TimeTrigger PT5M): служба ввода Windows дважды за сутки уходила в холостой цикл (до ~3 ядер); если за 30 с
   больше 25 % ядра — пишет улики в `W:\tools\tih_watchdog.log` (возраст процесса, активное окно, раскладка,
