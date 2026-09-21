@@ -37,7 +37,8 @@ using System.Web.Script.Serialization;
 static class Aurora3D
 {
     // ---------- параметры ----------
-    const int W = 960, H = 540;
+    // 21.09 ночь: слой сразу 1920x1080 (раньше 960x540 и растяжение в ffmpeg); SC — масштаб пиксельных отступов/шрифта
+    const int W = 1920, H = 1080; const double SC = W / 960.0; const float SCF = (float)SC;
     const int IW = 160, IH = 90;
     const int SLICES = 200; const double SLICE_SEC = 0.1;   // срез на каждый кадр анализа (10 к/с), 20 с в глубину
     const int YBINS = 48, UVB = 48;
@@ -511,13 +512,15 @@ static class Aurora3D
 
     // ===== 2026-09-21 (ночь): «тоннель грамматик» (просьба пользователя) =====
     // Веер убран. Все 10 грамматик — 3D и делят круг поровну: десятигранный тоннель, каждая грамматика — своя грань,
-    // повёрнутая на свой угол (i·36°) вокруг оси взгляда. У кромки (z = 0) — «сейчас», вглубь к центру — прошлое за 20 с;
-    // кольца-метки ЧЧ:ММ:СС через 5 с уходят вдаль по всем граням. Выключенная грамматика — пустая грань.
+    // повёрнутая на свой угол (i·36°) вокруг оси взгляда. «Сейчас» рождается в глубине у центра и наезжает на зрителя,
+    // у кромки (z = 0) — 20 с назад; кольца-метки ЧЧ:ММ:СС через 5 с летят на зрителя по всем граням. Выключенная грамматика — пустая грань.
     // Грань в своих координатах: x — поперёк грани [−HW, HW], y = −TR + h·HMAX — высота данных над гранью, z — время.
     const double TR = 1.0, TD = 6.0, HMAX = 0.62;
     static readonly double HW = TR * Math.Tan(Math.PI / 10);
-    static float[] allM;
-    static double ZA(double age) { return -age / 20 * TD; }
+    static float[] allM; static double spin; static readonly DateTime T0 = DateTime.Now;
+    static float[] RotZ(double a) { var m = new float[16]; float c = (float)Math.Cos(a), s = (float)Math.Sin(a); m[0] = c; m[1] = s; m[4] = -s; m[5] = c; m[10] = m[15] = 1; return m; }
+    // 21.09 ночь, по просьбе: тоннель НАЕЗЖАЕТ — «сейчас» рождается в глубине (z = −TD) и летит на зрителя, к кромке (z = 0)
+    static double ZA(double age) { return -TD + Math.Min(20, age) / 20 * TD; }
     static double WallAng(int i) { return i * 2 * Math.PI / GRAM.Length; }          // 0 — нижняя грань, дальше против часовой
     static void WallBegin(int i) { GL.glPushMatrix(); GL.glRotatef((float)(WallAng(i) * 180 / Math.PI), 0, 0, 1); }
     static void WallEnd() { GL.glPopMatrix(); }
@@ -527,7 +530,7 @@ static class Aurora3D
     static void LW(int i, double x, double y, double z, string s, Color c, int align, float dy)
     {
         double a = WallAng(i), ca = Math.Cos(a), sa = Math.Sin(a); float px, py;
-        if (Proj(allM, x * ca - y * sa, x * sa + y * ca, z, 0, 0, W, H, out px, out py)) L(s, px, py + dy, c, align);
+        if (Proj(allM, x * ca - y * sa, x * sa + y * ca, z, 0, 0, W, H, out px, out py)) L(s, px, py + dy * SCF, c, align);
     }
     static void Vk(double x, double y, double z, Color c, double k) { V(x, y, z, c.R / 255.0 * k, c.G / 255.0 * k, c.B / 255.0 * k); }
     static void HueColor(double u, double v, out double r, out double g, out double b)
@@ -557,9 +560,41 @@ static class Aurora3D
     static readonly Dictionary<string, List<double>> particles = new Dictionary<string, List<double>>();
     static readonly Random rnd = new Random();
 
+    // ---------- часы по периметру кадра (вместо бегущего квадратика ffmpeg внизу — просьба пользователя) ----------
+    // круг — 60 с по часовой стрелке от середины верхней кромки, риски каждую секунду, длинные с подписью — через 5 с
+    static void PerimPt(double f, out double x, out double y, out double nx, out double ny)
+    {
+        double m = 10 * SC, w = W - 2 * m, h = H - 2 * m, P = 2 * (w + h), d = ((f % 1) + 1) % 1 * P;
+        if (d < w / 2) { x = W / 2.0 + d; y = m; nx = 0; ny = 1; return; } d -= w / 2;
+        if (d < h) { x = W - m; y = m + d; nx = -1; ny = 0; return; } d -= h;
+        if (d < w) { x = W - m - d; y = H - m; nx = 0; ny = -1; return; } d -= w;
+        if (d < h) { x = m; y = H - m - d; nx = 1; ny = 0; return; } d -= h;
+        x = m + d; y = m; nx = 0; ny = 1;
+    }
+    static void DrawPerimeterClock(DateTime now)
+    {
+        Scene2D(); var cY = Color.FromArgb(255, 214, 90);
+        for (int s = 0; s < 60; s++)
+        {
+            double x, y, nx, ny; PerimPt(s / 60.0, out x, out y, out nx, out ny); double l = (s % 5 == 0 ? 16 : 7) * SC;
+            Vk(x, y, 0, cAx, s % 5 == 0 ? 0.55 : 0.3); Vk(x + nx * l, y + ny * l, 0, cAx, s % 5 == 0 ? 0.55 : 0.3);
+            if (s % 5 == 0) L(s.ToString("00"), (float)(x + nx * 30 * SC), (float)(y + ny * 30 * SC - 7 * SC), cAx, 2);
+        }
+        GL.glLineWidth(1.5f * SCF); Flush(0x0001);
+        double f = (now.Second + now.Millisecond / 1000.0) / 60.0, q = 7 * SC;
+        for (int k = 8; k >= 0; k--)                                                 // хвост 0,8 с, затухает
+        {
+            double x, y, nx, ny; PerimPt(f - k * 0.1 / 60.0, out x, out y, out nx, out ny); double kk = k == 0 ? 1 : 0.5 * (1 - k / 9.0);
+            Vk(x - q, y - q, 0, cY, kk); Vk(x + q, y - q, 0, cY, kk); Vk(x + q, y + q, 0, cY, kk); Vk(x - q, y + q, 0, cY, kk);
+        }
+        Flush(0x0007);
+    }
     static void DrawAll(List<Slice> hs, float[,] dist, DateTime now, double dt)
     {
-        var P = Persp(62, (double)W / H, 0.05, 40); var Vw = LookAt(0, 0, 1.9 / zoom, 0, 0, -TD); var Mo = Orbit(0, 0, -TD / 2);
+        // многогранник медленно крутится вокруг оси взгляда (просьба пользователя): оборот за 90 с
+        spin = (DateTime.Now - T0).TotalSeconds / 90.0 * 2 * Math.PI;
+        // камера на 2,2 — чтобы подписи снаружи кромки влезали в кадр сверху и снизу
+        var P = Persp(62, (double)W / H, 0.05, 40); var Vw = LookAt(0, 0, 2.2 / zoom, 0, 0, -TD); var Mo = Mul(Orbit(0, 0, -TD / 2), RotZ(spin));
         allM = Mul(P, Mul(Vw, Mo)); Scene3D(P, Vw, Mo, 0, 0, W, H);
         int n = GRAM.Length; double cr = TR / Math.Cos(Math.PI / n);
         Func<int, double> corner = j => -Math.PI / 2 + Math.PI / n + j * 2 * Math.PI / n;
@@ -572,11 +607,27 @@ static class Aurora3D
             if (ti >= 0) { tt = tick0.AddSeconds(-5 * ti); age = (now - tt).TotalSeconds; if (age > 20) continue; }
             double z = ZA(age), k = ti < 0 ? 0.45 : 0.3 * (1 - age / 20) + 0.06;
             for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(cr * Math.Cos(a0), cr * Math.Sin(a0), z, cAx, k); Vk(cr * Math.Cos(a1), cr * Math.Sin(a1), z, cAx, k); }
-            if (ti >= 0) { float px, py; if (Proj(allM, 0, TR, z, 0, 0, W, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px, py - 14, cAx, 2); }
+            if (ti >= 0) { float px, py; if (Proj(allM, 0, TR, z, 0, 0, W, H, out px, out py)) L(tt.ToString("HH:mm:ss"), px, py - 14 * SCF, cAx, 2); }
         }
+        for (int j = 0; j < n; j++) { double a0 = corner(j), a1 = corner(j + 1); Vk(cr * Math.Cos(a0), cr * Math.Sin(a0), 0, cAx, 0.3); Vk(cr * Math.Cos(a1), cr * Math.Sin(a1), 0, cAx, 0.3); }
         Flush(0x0001);
-        // названия граней у кромки
-        for (int i = 0; i < n; i++) LW(i, 0, -TR - 0.05, 0, GRAM[i] + (G(GRAM[i]) ? "" : " · выкл"), G(GRAM[i]) ? GCOL[i] : Color.FromArgb(120, 120, 120), 2, -6);
+        // названия грамматик — снаружи многогранника, у внешней кромки своей грани, вдоль её ребра (просьба пользователя):
+        // текстура в плоскости кромки (z = 0), верх букв — к центру; крутится вместе с многогранником
+        GL.glBlendFunc(0x0302, 1);                                   // GL_SRC_ALPHA, GL_ONE — аддитивно по альфе текстуры
+        for (int i = 0; i < n; i++)
+        {
+            bool on = G(GRAM[i]); var col = on ? GCOL[i] : Color.FromArgb(120, 120, 120);
+            string name = GRAM[i] + (on ? "" : " · выкл");
+            var tb = TextBmp(name, col, bigFont, StringFormat.GenericTypographic); uint tx = TexFor("big|" + col.ToArgb() + "|" + name, tb);
+            double asp = (double)tb.Width / tb.Height, hgt = Math.Min(0.075, 2 * HW * 0.95 / asp), len = hgt * asp, yt = -cr * Math.Cos(Math.PI / n) - 0.02, yb = yt - hgt;
+            // грань в верхней половине экрана — подпись повёрнута на 180°, чтобы читалась, а не вверх ногами
+            bool up = Math.Sin(-Math.PI / 2 + WallAng(i) + spin) > 0.05;
+            WallBegin(i);
+            if (!up) GL.TexQuad(tx, on ? 0.95f : 0.55f, -len / 2, yb, 0, len / 2, yb, 0, len / 2, yt, 0, -len / 2, yt, 0);
+            else GL.TexQuad(tx, on ? 0.95f : 0.55f, len / 2, yt, 0, -len / 2, yt, 0, -len / 2, yb, 0, len / 2, yb, 0);
+            WallEnd();
+        }
+        GL.glBlendFunc(1, 1);
 
         Dictionary<string, List<Pt>> S; lock (lk) S = series.ToDictionary(kv => kv.Key, kv => new List<Pt>(kv.Value));
         Func<string, List<Pt>> Sr = k => S.ContainsKey(k) ? S[k] : new List<Pt>();
@@ -600,14 +651,14 @@ static class Aurora3D
                 GL.glPopMatrix();
             }
             GL.glBlendFunc(1, 1);
-            if (dist != null) { for (int x = 0; x < IW; x++) for (int b = 0; b < YBINS; b++) { float c = dist[x, b]; if (c > 0) Vk(-HW + 2 * HW * x / (IW - 1), Yh((b + 0.5) / YBINS), 0.01, GCOL[0], Math.Min(0.8, 0.12 + c / 20.0)); } GL.glPointSize(2); Flush(0x0000); }
+            if (dist != null) { for (int x = 0; x < IW; x++) for (int b = 0; b < YBINS; b++) { float c = dist[x, b]; if (c > 0) Vk(-HW + 2 * HW * x / (IW - 1), Yh((b + 0.5) / YBINS), ZA(0) + 0.01, GCOL[0], Math.Min(0.8, 0.12 + c / 20.0)); } GL.glPointSize(2 * SCF); Flush(0x0000); }
             WallEnd();
             LW(0, HW, Yh(1), 0, "Y 255", GCOL[0], 0, -6);
         }
         // 1 Вектор — точки цвета кадра: поперёк грани U, высота V
         if (G(GRAM[1]) && haveInput)
         {
-            WallBegin(1); GL.glBlendFunc(0x8001, 1); GL.glPointSize(2);
+            WallBegin(1); GL.glBlendFunc(0x8001, 1); GL.glPointSize(2 * SCF);
             foreach (var s in hs)
             {
                 double age = (now - s.t).TotalSeconds; if (age > 20) continue;
@@ -629,8 +680,9 @@ static class Aurora3D
             }
             GL.glBlendFunc(1, 1);
             // рамка окна U/V ±32 на кромке
-            Vk(-HW, Yh(0), 0, GCOL[1], 0.4); Vk(HW, Yh(0), 0, GCOL[1], 0.4); Vk(-HW, Yh(1), 0, GCOL[1], 0.4); Vk(HW, Yh(1), 0, GCOL[1], 0.4);
-            Vk(0, Yh(0), 0, GCOL[1], 0.25); Vk(0, Yh(1), 0, GCOL[1], 0.25); Flush(0x0001);
+            double zn = ZA(0);
+            Vk(-HW, Yh(0), zn, GCOL[1], 0.4); Vk(HW, Yh(0), zn, GCOL[1], 0.4); Vk(-HW, Yh(1), zn, GCOL[1], 0.4); Vk(HW, Yh(1), zn, GCOL[1], 0.4);
+            Vk(0, Yh(0), zn, GCOL[1], 0.25); Vk(0, Yh(1), zn, GCOL[1], 0.25); Flush(0x0001);
             WallEnd();
             LW(1, HW, Yh(1), 0, "U →, V ↑", GCOL[1], 0, -6);
         }
@@ -640,7 +692,7 @@ static class Aurora3D
             WallBegin(2);
             WallLine(Sr("light"), now, -HW * 0.45, 0, 255, Color.FromArgb(255, 140, 58), 6);
             WallLine(Sr("motion"), now, HW * 0.45, 0, 24, Color.FromArgb(96, 255, 128), 6);
-            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            GL.glLineWidth(2 * SCF); Flush(0x0001); GL.glLineWidth(1 * SCF); WallEnd();
             LW(2, -HW * 0.45, Yh(N01(Lst("light"), 0, 255)), 0, "свет " + F(Lst("light"), "0"), Color.FromArgb(255, 170, 110), 2, -16);
             LW(2, HW * 0.45, Yh(N01(Lst("motion"), 0, 24)), 0, "движ. " + F(Lst("motion"), "0.#"), Color.FromArgb(120, 255, 150), 2, -16);
         }
@@ -650,7 +702,7 @@ static class Aurora3D
             WallBegin(3);
             WallLine(Sr("t_out"), now, -HW * 0.45, 10, 40, Color.FromArgb(150, 225, 255), 2);
             WallLine(Sr("power_kw"), now, HW * 0.45, 0, 8, Color.FromArgb(255, 205, 90), 2);
-            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            GL.glLineWidth(2 * SCF); Flush(0x0001); GL.glLineWidth(1 * SCF); WallEnd();
             LW(3, -HW * 0.45, Yh(N01(Lst("t_out"), 10, 40)), 0, "улица " + F(Lst("t_out"), "0.#") + " °C", Color.FromArgb(150, 225, 255), 2, -16);
             LW(3, HW * 0.45, Yh(N01(Lst("power_kw"), 0, 8)), 0, "дом " + F(Lst("power_kw"), "0.##") + " кВт", Color.FromArgb(255, 205, 90), 2, -16);
         }
@@ -691,7 +743,7 @@ static class Aurora3D
             };
             bars(ch, -HW, HW * 0.62, v => (v - 30) / 70, Color.FromArgb(255, 150, 70));
             bars(eh, -HW * 0.3, HW * 1.3, v => Math.Sqrt(Math.Max(0, v) / 6000), Color.FromArgb(255, 220, 90));
-            GL.glLineWidth(3); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            GL.glLineWidth(3 * SCF); Flush(0x0001); GL.glLineWidth(1 * SCF); WallEnd();
             if (ch.Count > 0 && ch[0].v != null) LW(5, -HW * 0.69, -TR + 0.1, 0, "ядра " + string.Join(" ", ch[0].v.Select(v => F(v, "0"))), Color.FromArgb(255, 150, 70), 2, 10);
             if (eh.Count > 0 && eh[0].v != null)
                 for (int j = 0; j < en.Length && j < eh[0].v.Length; j++)
@@ -716,7 +768,7 @@ static class Aurora3D
                 double len = Math.Min(0.28, l), k = 0.15 + 0.75 * (1 - age / 20), x0 = HW * 0.5, y0 = -TR + 0.3;
                 Vk(x0, y0, ZA(age), cM, k * 0.2); Vk(x0 + vx / l * len, y0 + vy / l * len, ZA(age), cM, k);
             }
-            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            GL.glLineWidth(2 * SCF); Flush(0x0001); GL.glLineWidth(1 * SCF); WallEnd();
             object u; string unit; lock (lk) unit = mq.TryGetValue("wind_unit", out u) ? (string)u : "";
             string[] dirs = { "С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ" };
             double wbl = Lst("wind_b");
@@ -734,7 +786,7 @@ static class Aurora3D
                 double x = -HW * 0.85 + HW * 1.7 * ((e.src.GetHashCode() & 0xffff) / 65535.0), k = age < 2 ? 1 : 0.35 + 0.5 * (1 - age / 20);
                 Vk(x, -TR, ZA(age), e.c, k * 0.3); Vk(x, Yh(0.9), ZA(age), e.c, k);
             }
-            GL.glLineWidth(3); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            GL.glLineWidth(3 * SCF); Flush(0x0001); GL.glLineWidth(1 * SCF); WallEnd();
             foreach (var e in ev) { double age = (now - e.t).TotalSeconds; if (age < 10) LW(7, -HW * 0.85 + HW * 1.7 * ((e.src.GetHashCode() & 0xffff) / 65535.0), Yh(0.9), ZA(age), e.src, e.c, 2, -14); }
         }
         // 8 Состояния — 4 дорожки вдоль грани, светятся, пока состояние «да»
@@ -775,7 +827,7 @@ static class Aurora3D
                 Vk(x, -TR + 0.005, 0, c, 0.15); Vk(x, -TR + 0.005, -TD, c, 0.03);
                 r++;
             }
-            GL.glLineWidth(2); Flush(0x0001); GL.glLineWidth(1); WallEnd();
+            GL.glLineWidth(2 * SCF); Flush(0x0001); GL.glLineWidth(1 * SCF); WallEnd();
             r = 0;
             foreach (var kv in fl)
             {
@@ -797,11 +849,20 @@ static class Aurora3D
     // 25 к/с (21.09, поздний вечер): текст GDI+ дорогой — каждая подпись рисуется один раз в маленькую картинку
     // (с чёрным контуром) и дальше только копируется; кэш сбрасывается, когда разрастается (метки времени меняются).
     static readonly Dictionary<string, Bitmap> textCache = new Dictionary<string, Bitmap>();
+    static Font bigFont = new Font("Consolas", 40f, FontStyle.Bold, GraphicsUnit.Pixel);   // для надписей вдоль граней
+    static readonly Dictionary<string, uint> texOf = new Dictionary<string, uint>();
+    static uint TexFor(string key, Bitmap b)
+    {
+        uint t; if (texOf.TryGetValue(key, out t)) return t;
+        var d = b.LockBits(new Rectangle(0, 0, b.Width, b.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try { t = GL.UploadTex(b.Width, b.Height, d.Scan0); } finally { b.UnlockBits(d); }
+        texOf[key] = t; return t;
+    }
     static Bitmap TextBmp(string s, Color c, Font font, StringFormat fmt)
     {
         string key = c.ToArgb() + "|" + s; Bitmap b;
         if (textCache.TryGetValue(key, out b)) return b;
-        if (textCache.Count > 600) { foreach (var v in textCache.Values) v.Dispose(); textCache.Clear(); }
+        if (textCache.Count > 600) { foreach (var v in textCache.Values) v.Dispose(); textCache.Clear(); foreach (var t in texOf.Values) GL.DeleteTex(t); texOf.Clear(); }
         SizeF sz; using (var tmp = new Bitmap(1, 1)) using (var tg = Graphics.FromImage(tmp)) sz = tg.MeasureString(s, font, new PointF(0, 0), fmt);
         b = new Bitmap(Math.Max(1, (int)Math.Ceiling(sz.Width) + 3), Math.Max(1, (int)Math.Ceiling(sz.Height) + 3), PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(b))
@@ -830,8 +891,8 @@ static class Aurora3D
         new Thread(OnvifLoop) { IsBackground = true }.Start();
         GL.Init(W, H);
         Log("OpenGL: " + GL.Renderer);
-        var px = new byte[W * H * 4]; var outb = new byte[W * H * 4];
-        var font = new Font("Consolas", 12f, FontStyle.Bold, GraphicsUnit.Pixel);
+        var outb = new byte[W * H * 5 / 2];   // yuva420p: Y, U, V, A
+        var font = new Font("Consolas", 12f * SCF, FontStyle.Bold, GraphicsUnit.Pixel);
         var shadow = new SolidBrush(Color.FromArgb(200, 0, 0, 0));
         var fmt = StringFormat.GenericTypographic;
         DateTime prev = DateTime.Now;
@@ -840,10 +901,10 @@ static class Aurora3D
             NamedPipeServerStream pipe = null;
             try
             {
-                pipe = new NamedPipeServerStream("aurora3d", PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.None, 0, W * H * 4);
+                pipe = new NamedPipeServerStream("aurora3d", PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.None, 0, W * H * 5 / 2);
                 pipe.WaitForConnection();
                 Log("читатель подключился");
-                var sw = Stopwatch.StartNew(); long frame = 0; int statN = 0; double statMs = 0, statW = 0; DateTime statT = DateTime.Now;
+                var sw = Stopwatch.StartNew(); long frame = 0; int statN = 0; double statMs = 0, statW = 0, stDraw = 0, stLab = 0, stPost = 0; DateTime statT = DateTime.Now;
                 while (pipe.IsConnected)
                 {
                     var now = DateTime.Now; double dt = Math.Min(0.5, (now - prev).TotalSeconds); prev = now;
@@ -852,45 +913,37 @@ static class Aurora3D
                     lock (lk) { hs = new List<Slice>(hist); dist = frontDist; }
                     labels.Clear();
                     GL.glClearColor(0, 0, 0, 0); GL.glClear(0x4000 | 0x100);
+                    double tA = sw.Elapsed.TotalMilliseconds;
                     DrawAll(hs, dist, now, dt);
-                    Legend();
-                    // второй проход на GPU (шейдер): альфа = максимум канала, «распремножение», переворот строк —
-                    // раньше это был цикл по 518 тыс. пикселей на CPU (~8 мс на кадр); теперь кадр читается готовым
-                    GL.PostPass(outb);
-                    var h = GCHandle.Alloc(outb, GCHandleType.Pinned);
-                    try
+                    DrawPerimeterClock(now);
+                    Legend(); GL.glFinish(); double tB = sw.Elapsed.TotalMilliseconds; stDraw += tB - tA;
+                    // подписи: GDI+ растрирует строку ОДИН раз (кэш), дальше она — текстура на видеокарте
+                    var ws = legendParts.Select(p => (float)TextBmp(p.s, p.c, font, fmt).Width + 14 * SCF).ToArray();
+                    for (int row = 0; row < 2; row++)
                     {
-                        using (var bmp = new Bitmap(W, H, W * 4, PixelFormat.Format32bppArgb, h.AddrOfPinnedObject()))
-                        using (var gr = Graphics.FromImage(bmp))
-                        {
-                            gr.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
-                            // легенда сверху по центру
-                            // две строки по 5: в одну легенда заезжала на часы слева
-                            var ws = legendParts.Select(p => (float)TextBmp(p.s, p.c, font, fmt).Width + 14).ToArray();
-                            for (int row = 0; row < 2; row++)
-                            {
-                                int a0 = row * 5, a1 = Math.Min(legendParts.Count, a0 + 5); float lw = 0;
-                                for (int i = a0; i < a1; i++) lw += ws[i];
-                                float lx = (W - lw) / 2;
-                                for (int i = a0; i < a1; i++) { var p = legendParts[i]; p.x = lx; p.y = 4 + row * 14; p.align = 0; labels.Add(p); lx += ws[i]; }
-                            }
-                            gr.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceOver;
-                            foreach (var l in labels)
-                            {
-                                var tb = TextBmp(l.s, l.c, font, fmt); float x = l.x - 1;
-                                if (l.align == 1) x -= tb.Width - 3; else if (l.align == 2) x -= (tb.Width - 3) / 2f;
-                                gr.DrawImageUnscaled(tb, (int)x, (int)l.y - 1);
-                            }
-                        }
+                        int a0 = row * 5, a1 = Math.Min(legendParts.Count, a0 + 5); float lw = 0;
+                        for (int i = a0; i < a1; i++) lw += ws[i];
+                        float lx = (W - lw) / 2;
+                        for (int i = a0; i < a1; i++) { var p = legendParts[i]; p.x = lx; p.y = (4 + row * 14) * SCF; p.align = 0; labels.Add(p); lx += ws[i]; }
                     }
-                    finally { h.Free(); }
+                    GL.LabelsBegin();
+                    foreach (var l in labels)
+                    {
+                        var tb = TextBmp(l.s, l.c, font, fmt); float x = l.x - 1;
+                        if (l.align == 1) x -= tb.Width - 3; else if (l.align == 2) x -= (tb.Width - 3) / 2f;
+                        GL.DrawTex(TexFor(l.c.ToArgb() + "|" + l.s, tb), (int)x, (int)l.y - 1, tb.Width, tb.Height);
+                    }
+                    GL.LabelsEnd(); GL.glFinish(); double tC = sw.Elapsed.TotalMilliseconds; stLab += tC - tB;
+                    // итог на GPU: свечение (аддитивное) + подписи → прямая альфа → yuva420p (Y, U и V на ½, A) в 4 прохода шейдера;
+                    // ffmpeg берёт кадр как есть, без растяжения и перевода цвета
+                    GL.PostPassYuva(outb); stPost += sw.Elapsed.TotalMilliseconds - tC;
                     var tw0 = sw.Elapsed.TotalMilliseconds; pipe.Write(outb, 0, outb.Length); statW += sw.Elapsed.TotalMilliseconds - tw0;
                     frame++;
                     // 25 к/с (40 мс на кадр); раз в минуту — фактическая частота и время кадра в журнал
                     long due = (long)(frame * 40) - sw.ElapsedMilliseconds;
                     if (due > 0) Thread.Sleep((int)due); else if (due < -1000) { frame = sw.ElapsedMilliseconds / 40; }
                     statN++; statMs += (DateTime.Now - now).TotalMilliseconds;
-                    if ((DateTime.Now - statT).TotalSeconds >= 20) { Log("кадров/с " + F(statN / (DateTime.Now - statT).TotalSeconds, "0.0") + ", кадр " + F(statMs / Math.Max(1, statN), "0.0") + " мс, из них запись в канал " + F(statW / Math.Max(1, statN), "0.0") + " мс"); statN = 0; statMs = 0; statW = 0; statT = DateTime.Now; }
+                    if ((DateTime.Now - statT).TotalSeconds >= 20) { Log("кадров/с " + F(statN / (DateTime.Now - statT).TotalSeconds, "0.0") + ", кадр " + F(statMs / Math.Max(1, statN), "0.0") + " мс: сцена " + F(stDraw / Math.Max(1, statN), "0.0") + ", подписи " + F(stLab / Math.Max(1, statN), "0.0") + ", итог+считывание " + F(stPost / Math.Max(1, statN), "0.0") + ", запись в канал " + F(statW / Math.Max(1, statN), "0.0") + " мс; текстур подписей " + texOf.Count); statN = 0; statMs = 0; statW = 0; stDraw = stLab = stPost = 0; statT = DateTime.Now; }
                 }
             }
             catch (Exception e) { Log("выход: " + e.Message); }
@@ -937,6 +990,86 @@ static class GL
         uint t; glGenTextures(1, out t); glBindTexture(0x0DE1, t);
         glTexImage2D(0x0DE1, 0, 0x8058, w, h, 0, 0x1908, 0x1401, IntPtr.Zero);
         glTexParameteri(0x0DE1, 0x2801, 0x2600); glTexParameteri(0x0DE1, 0x2800, 0x2600);   // GL_NEAREST: 1:1, без размытия
+        return t;
+    }
+    [DllImport("opengl32.dll")] static extern void glReadPixels(int x, int y, int w, int h, uint fmt, uint type, IntPtr data);
+    [DllImport("opengl32.dll")] static extern void glPixelStorei(uint p, int v);
+    [DllImport("opengl32.dll")] static extern void glDeleteTextures(int n, ref uint t);
+    [DllImport("opengl32.dll")] static extern void glColor4f(float r, float g, float b, float a);
+    delegate void BlendSepFn(uint sr, uint dr, uint sa, uint da);
+    delegate void ActiveTexFn(uint unit);
+    delegate void Uniform2fFn(int loc, float x, float y);
+    static uint fbo3, tex3, fboY, fboU, fboV, fboA, texY, texU, texV, texA, progY;
+    static int locMode, locPx;
+    public static void DeleteTex(uint t) { glDeleteTextures(1, ref t); }
+    public static uint UploadTex(int w, int h, IntPtr bgra)
+    {
+        uint t; glGenTextures(1, out t); glBindTexture(0x0DE1, t);
+        glTexParameteri(0x0DE1, 0x2801, 0x2600); glTexParameteri(0x0DE1, 0x2800, 0x2600);
+        glTexImage2D(0x0DE1, 0, 0x8058, w, h, 0, 0x80E1, 0x1401, bgra);
+        glBindTexture(0x0DE1, 0); return t;
+    }
+    // слой подписей: отдельная текстура с настоящей альфой (у аддитивного свечения альфа — из яркости, тени там не бывает)
+    public static void LabelsBegin()
+    {
+        bindFb(0x8D40, fbo3); glViewport(0, 0, W_, H_); glClearColor(0, 0, 0, 0); glClear(0x4000);
+        glMatrixMode(0x1701); var m = new float[16]; m[0] = 2f / W_; m[5] = -2f / H_; m[10] = -1; m[12] = -1; m[13] = 1; m[15] = 1; glLoadMatrixf(m);
+        glMatrixMode(0x1700); glLoadMatrixf(Id());
+        glEnable(0x0DE1); glColor4f(1, 1, 1, 1);
+        Fn<BlendSepFn>("glBlendFuncSeparate")(0x0302, 0x0303, 1, 0x0303);   // цвет premultiplied, альфа «поверх»
+    }
+    public static void DrawTex(uint t, int x, int y, int w, int h)
+    {
+        glBindTexture(0x0DE1, t); glBegin(0x0007);
+        glTexCoord2f(0, 0); glVertex2f(x, y); glTexCoord2f(1, 0); glVertex2f(x + w, y); glTexCoord2f(1, 1); glVertex2f(x + w, y + h); glTexCoord2f(0, 1); glVertex2f(x, y + h);
+        glEnd();
+    }
+    // четырёхугольник с текстурой в 3D (координаты — четыре вершины: начало-низ, конец-низ, конец-верх, начало-верх строки)
+    public static void TexQuad(uint t, float k, double x0, double y0, double z0, double x1, double y1, double z1, double x2, double y2, double z2, double x3, double y3, double z3)
+    {
+        glEnable(0x0DE1); glBindTexture(0x0DE1, t); glColor4f(k, k, k, 1);
+        glBegin(0x0007);
+        glTexCoord2f(0, 1); glVertex3f((float)x0, (float)y0, (float)z0); glTexCoord2f(1, 1); glVertex3f((float)x1, (float)y1, (float)z1);
+        glTexCoord2f(1, 0); glVertex3f((float)x2, (float)y2, (float)z2); glTexCoord2f(0, 0); glVertex3f((float)x3, (float)y3, (float)z3);
+        glEnd(); glBindTexture(0x0DE1, 0); glDisable(0x0DE1);
+    }
+    [DllImport("opengl32.dll")] static extern void glVertex3f(float x, float y, float z);
+    public static void LabelsEnd() { glDisable(0x0DE1); glBindTexture(0x0DE1, 0); glBlendFunc(1, 1); bindFb(0x8D40, fbo1); }
+    // итог в yuva420p: 4 прохода шейдера (Y, U, V, A) по текстурам свечения [0] и подписей [1] → R8-текстуры → glReadPixels
+    public static void PostPassYuva(byte[] outb)
+    {
+        glDisable(0x0BE2); glMatrixMode(0x1701); glLoadMatrixf(Id()); glMatrixMode(0x1700); glLoadMatrixf(Id());
+        var at = Fn<ActiveTexFn>("glActiveTexture");
+        at(0x84C1); glBindTexture(0x0DE1, tex3); at(0x84C0); glBindTexture(0x0DE1, tex1);
+        Fn<UIntFn>("glUseProgram")(progY); glPixelStorei(0x0D05, 1);
+        var h = GCHandle.Alloc(outb, GCHandleType.Pinned);
+        try
+        {
+            IntPtr p0 = h.AddrOfPinnedObject(); int ys = W_ * H_, cs = (W_ / 2) * (H_ / 2);
+            uint[] fb = { fboY, fboU, fboV, fboA }; int[] off = { 0, ys, ys + cs, ys + 2 * cs };
+            for (int mode = 0; mode < 4; mode++)
+            {
+                int w = (mode == 1 || mode == 2) ? W_ / 2 : W_, hh = (mode == 1 || mode == 2) ? H_ / 2 : H_;
+                bindFb(0x8D40, fb[mode]); glViewport(0, 0, w, hh);
+                Fn<Uniform1iFn>("glUniform1i")(locMode, mode);
+                glBegin(0x0007);
+                glTexCoord2f(0, 1); glVertex2f(-1, -1); glTexCoord2f(1, 1); glVertex2f(1, -1);
+                glTexCoord2f(1, 0); glVertex2f(1, 1); glTexCoord2f(0, 0); glVertex2f(-1, 1);
+                glEnd();
+                glReadPixels(0, 0, w, hh, 0x1903, 0x1401, IntPtr.Add(p0, off[mode]));
+            }
+        }
+        finally { h.Free(); }
+        Fn<UIntFn>("glUseProgram")(0);
+        at(0x84C1); glBindTexture(0x0DE1, 0); at(0x84C0); glBindTexture(0x0DE1, 0);
+        bindFb(0x8D40, fbo1); glViewport(0, 0, W_, H_); glEnable(0x0BE2);
+    }
+    static uint R8(int w, int h, FbTex2DFn fbTex, out uint fbo)
+    {
+        uint t; glGenTextures(1, out t); glBindTexture(0x0DE1, t);
+        glTexImage2D(0x0DE1, 0, 0x8229, w, h, 0, 0x1903, 0x1401, IntPtr.Zero);          // GL_R8 / GL_RED
+        glTexParameteri(0x0DE1, 0x2801, 0x2600); glTexParameteri(0x0DE1, 0x2800, 0x2600);
+        Fn<GenFn>("glGenFramebuffersEXT")(1, out fbo); bindFb(0x8D40, fbo); fbTex(0x8D40, 0x8CE0, 0x0DE1, t, 0);
         return t;
     }
     // второй проход: сцена (текстура 1) → шейдер → текстура 2 → glReadPixels в готовый буфер (сверху вниз, прямая альфа)
@@ -1024,7 +1157,32 @@ static class GL
         Fn<GenFn>("glGenRenderbuffersEXT")(1, out rd); Fn<BindFn>("glBindRenderbufferEXT")(RB, rd);
         Fn<StorageFn>("glRenderbufferStorageEXT")(RB, 0x81A6, w, h); Fn<AttachRbFn>("glFramebufferRenderbufferEXT")(FB, 0x8D00, RB, rd);
         glBindTexture(0x0DE1, 0);
+        tex3 = Tex(w, h); Fn<GenFn>("glGenFramebuffersEXT")(1, out fbo3); bindFb(FB, fbo3); fbTex(FB, 0x8CE0, 0x0DE1, tex3, 0);
+        texY = R8(w, h, fbTex, out fboY); texA = R8(w, h, fbTex, out fboA); texU = R8(w / 2, h / 2, fbTex, out fboU); texV = R8(w / 2, h / 2, fbTex, out fboV);
+        bindFb(FB, fbo1); glBindTexture(0x0DE1, 0);
         uint vs = Shader(0x8B31, "varying vec2 uv; void main(){ uv = gl_MultiTexCoord0.xy; gl_Position = gl_Vertex; }");
+        // yuva: итог = подписи поверх свечения (прямая альфа), BT.601 ограниченный диапазон; U/V — среднее 2x2 пикселей
+        uint fy = Shader(0x8B30,
+            "uniform sampler2D g; uniform sampler2D l; uniform int mode; uniform vec2 px; varying vec2 uv;" +
+            "vec4 comp(vec2 t){ vec3 c = texture2D(g, t).rgb; float ag = max(c.r, max(c.g, c.b)) * 0.784; vec3 gp = c * 0.784;" +
+            " vec4 L = texture2D(l, t); float a = L.a + ag * (1.0 - L.a); vec3 pm = L.rgb + gp * (1.0 - L.a);" +
+            " return a > 0.0 ? vec4(pm / a, a) : vec4(0.0); }" +
+            "void main(){ vec4 c;" +
+            " if (mode == 1 || mode == 2) { c = (comp(uv + vec2(-px.x, -px.y) * 0.5) + comp(uv + vec2(px.x, -px.y) * 0.5) + comp(uv + vec2(-px.x, px.y) * 0.5) + comp(uv + vec2(px.x, px.y) * 0.5)) * 0.25; }" +
+            " else c = comp(uv);" +
+            " float v;" +
+            " if (mode == 0) v = (16.0 + 65.481 * c.r + 128.553 * c.g + 24.966 * c.b) / 255.0;" +
+            " else if (mode == 1) v = (128.0 - 37.797 * c.r - 74.203 * c.g + 112.0 * c.b) / 255.0;" +
+            " else if (mode == 2) v = (128.0 + 112.0 * c.r - 93.786 * c.g - 18.214 * c.b) / 255.0;" +
+            " else v = c.a;" +
+            " gl_FragColor = vec4(v, 0.0, 0.0, 1.0); }");
+        progY = Fn<CreateProgramFn>("glCreateProgram")(); Fn<AttachFn>("glAttachShader")(progY, vs); Fn<AttachFn>("glAttachShader")(progY, fy); Fn<UIntFn>("glLinkProgram")(progY);
+        Fn<UIntFn>("glUseProgram")(progY);
+        Fn<Uniform1iFn>("glUniform1i")(Fn<UniformLocFn>("glGetUniformLocation")(progY, "g"), 0);
+        Fn<Uniform1iFn>("glUniform1i")(Fn<UniformLocFn>("glGetUniformLocation")(progY, "l"), 1);
+        locMode = Fn<UniformLocFn>("glGetUniformLocation")(progY, "mode"); locPx = Fn<UniformLocFn>("glGetUniformLocation")(progY, "px");
+        Fn<Uniform2fFn>("glUniform2f")(locPx, 1f / w, 1f / h);
+        Fn<UIntFn>("glUseProgram")(0);
         uint fs = Shader(0x8B30, "uniform sampler2D t; varying vec2 uv; void main(){ vec4 c = texture2D(t, uv); float a = max(c.r, max(c.g, c.b));" +
             " gl_FragColor = a > 0.0 ? vec4(c.rgb / a, a * 0.784) : vec4(0.0); }");
         prog = Fn<CreateProgramFn>("glCreateProgram")(); Fn<AttachFn>("glAttachShader")(prog, vs); Fn<AttachFn>("glAttachShader")(prog, fs);
