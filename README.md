@@ -16,10 +16,10 @@ xps.txt` в основном репозитории `/config`). Раньше п�
 |-----------------------------------|----------------------------------|------------|
 | `ffmpeg/variant_push.ps1`         | `W:\ffmpeg\variant_push.ps1`     | Варианты частоты xps_b<N> по требованию (runOnDemand в mediamtx): читает чистый xps_cam, кладёт оверлей/кольцо/часы/шарик, публикует xps_b<N> (2026-09-15) |
 | `ffmpeg/webcam_push.ps1`          | `W:\ffmpeg\webcam_push.ps1`      | Постоянный push веб-камеры в go2rtc/Frigate по RTMP (кодирование h264_mf, оверлей даты/времени/FPS/адресов/ProcAmp) |
-| `ffmpeg/sub_push.ps1`             | `W:\ffmpeg\sub_push.ps1`        | Субпоток xps_sub для архива на VPS по требованию (runOnDemand): чистый xps_cam → 640x360 10 к/с libx264 ~300 кбит/с (2026-09-18) |
+| `ffmpeg/sub_push.ps1`             | `W:\ffmpeg\sub_push.ps1`        | **Не используется с 2026-09-21** — xps_sub стал третьим выходом `webcam_push.ps1`; был субпоток по требованию (runOnDemand) |
 | `ffmpeg/build_dll.ps1`            | `W:\ffmpeg\build_dll.ps1`        | Исходник (инлайн C#) для `XpsCamProcAmp.dll` — DirectShow-обвязка чтения IAMVideoProcAmp |
 | `ffmpeg/XpsCamProcAmp.dll`        | `W:\ffmpeg\XpsCamProcAmp.dll`    | Собранный артефакт из `build_dll.ps1` (пересборка требует .NET на самой машине — держим готовую сборку, чтобы не компилировать при каждом старте, см. историю ниже) |
-| `ThermalLog/poll_thermal.ps1`     | `W:\ThermalLog\poll_thermal.ps1` | Опрос ACPI-температуры/загрузки CPU раз в минуту (Scheduled Task `ThermalLog`) |
+| `ThermalLog/poll_thermal.ps1`     | `W:\ThermalLog\poll_thermal.ps1` | Термо-лог раз в ~2 с (задача `ThermalLog`, SYSTEM, pwsh 7): DTS ядер/Package/мощность CPU и GPU NVIDIA через LibreHardwareMonitor + драйвер PawnIO → `latest.json`, `thermal_log.csv` |
 | `ThermalLog/http_server.ps1`      | `W:\ThermalLog\http_server.ps1`  | HTTP-мостик (порт 8090), отдаёт `latest.json` для rest-сенсоров HA |
 | `ThermalLog/lhm_probe.ps1`        | `W:\ThermalLog\lhm_probe.ps1`    | Разовый диагностический скрипт LibreHardwareMonitor (RPM вентилятора — тупик, см. память проекта) |
 | `mediamtx/mediamtx.yml`           | `W:\mediamtx\mediamtx.yml`       | Конфиг RTSP/RTMP-релея (принимает push от `webcam_push.ps1`, отдаёт RTSP наружу для Frigate) |
@@ -81,6 +81,28 @@ PNG пишется одним `WriteAllBytes`; имя функции `Measure` �
 Деплой файлов — **в первую очередь через MCP-сервер xps** (`xps_put` с `bom: true`; с 2026-09-16 правило: скрипт ниже
 конфликтует с постоянным WinRM-шеллом MCP — WSManFault InvalidSelectors). Запасной путь, только без MCP — `/config/.local/bin/xps_put.py <local> <remote> --bom` (кусками по 2000 символов
 base64, ровно один BOM), обратно — `xps_get.py`.
+
+## 2026-09-21: температура, две колонки, xps_sub в главном ffmpeg, скопы на весь кадр
+
+- **Температура CPU живая.** LibreHardwareMonitor 0.9.6 читает MSR/SuperIO не через WinRing0, а через
+  отдельный драйвер **PawnIO** (github namazso/PawnIO.Setup, `PawnIO_setup.exe -install -silent`, служба
+  `PawnIO`). Без него — тишина без ошибок (та самая «ring0 тихо не сработал» от 21.08). DTS даёт целые °C
+  (запас до TjMax = 103 °C), поэтому `poll_thermal.ps1` публикует скользящее среднее 5 замеров, сырые —
+  `*_raw_c`. SuperIO Fintek F71869A виден, но отдаёт мусор (гонка с BIOS/EC Dell) — не опрашивается.
+  Грабля: функция `R` — это псевдоним `r` = Invoke-History (псевдонимы важнее функций).
+- **Аура в две колонки** (слева Поток/Камера/Система/Температура/GPU, справа Сеть/Сессия/HA/GPU Оптиплекс),
+  масштаб подгоняется и по высоте; значки у заголовков — шрифт Segoe UI Emoji (в Consolas эмодзи нет, GDI+
+  шрифт не подменяет); числа — до 4 знаков без хвостовых нулей (`{0:0.####}`).
+- **xps_sub — третий выход главного ffmpeg** (`libx264 ultrafast`, 640x360@10, 300 кбит/с), `sub_push.ps1` и
+  runOnDemand в `mediamtx.yml` убраны. НЕ `h264_mf`: NVENC у GT 640M держит две сессии, и в одном процессе
+  MF третью Intel QSV не отдаёт — снова NVIDIA, весь ffmpeg падает (-542398533); в отдельном процессе Intel
+  выбирался. Итог ~5,8 % CPU вместо ~10,1 %.
+- **Скопы на весь кадр**, цветные и полупрозрачные: Сигнал (waveform column, голубой), Свет (жёлтый) и
+  Движение (зелёный) сводятся на одном холсте 320x180 и растягиваются одним слоем; Вектор (пурпурный) —
+  квадрат H×H по центру; внизу только легенда `overlay\scopes_leg_<WxH>.png`. Ключ/альфу считать на
+  маленькой картинке: `colorkey` на 1280x720 стоил ~9 % CPU, так — ~+3,5 % (ffmpeg ~9 %).
+- Перезапуск задачи камеры — повтор каждые 2 мин у триггера входа не срабатывал ни разу; добавлен
+  TimeTrigger с повтором PT2M (см. память проекта).
 
 ### Живые скопы «Сигнал» (2026-09-15)
 
