@@ -796,6 +796,29 @@ static class Aurora3D
     }
     static List<Label> legendParts = new List<Label>();
 
+    // 25 к/с (21.09, поздний вечер): текст GDI+ дорогой — каждая подпись рисуется один раз в маленькую картинку
+    // (с чёрным контуром) и дальше только копируется; кэш сбрасывается, когда разрастается (метки времени меняются).
+    static readonly Dictionary<string, Bitmap> textCache = new Dictionary<string, Bitmap>();
+    static Bitmap TextBmp(string s, Color c, Font font, StringFormat fmt)
+    {
+        string key = c.ToArgb() + "|" + s; Bitmap b;
+        if (textCache.TryGetValue(key, out b)) return b;
+        if (textCache.Count > 600) { foreach (var v in textCache.Values) v.Dispose(); textCache.Clear(); }
+        SizeF sz; using (var tmp = new Bitmap(1, 1)) using (var tg = Graphics.FromImage(tmp)) sz = tg.MeasureString(s, font, new PointF(0, 0), fmt);
+        b = new Bitmap(Math.Max(1, (int)Math.Ceiling(sz.Width) + 3), Math.Max(1, (int)Math.Ceiling(sz.Height) + 3), PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(b))
+        using (var sh = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
+        using (var br = new SolidBrush(c))
+        {
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+            foreach (var d in new[] { new[] { 0, 1 }, new[] { 2, 1 }, new[] { 1, 0 }, new[] { 1, 2 } }) g.DrawString(s, font, sh, d[0], d[1], fmt);
+            g.DrawString(s, font, br, 1, 1, fmt);
+        }
+        textCache[key] = b; return b;
+    }
+    static readonly byte[] unpm = BuildUnpm();                 // unpm[a*256+c] = c*255/a — без деления в цикле
+    static byte[] BuildUnpm() { var t = new byte[65536]; for (int a = 1; a < 256; a++) for (int c = 0; c <= a; c++) t[a * 256 + c] = (byte)(c * 255 / a); return t; }
+
     // ---------- главный цикл ----------
     static int Main()
     {
@@ -822,7 +845,7 @@ static class Aurora3D
                 pipe = new NamedPipeServerStream("aurora3d", PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.None, 0, W * H * 4);
                 pipe.WaitForConnection();
                 Log("читатель подключился");
-                var sw = Stopwatch.StartNew(); long frame = 0;
+                var sw = Stopwatch.StartNew(); long frame = 0; int statN = 0; double statMs = 0, statW = 0; DateTime statT = DateTime.Now;
                 while (pipe.IsConnected)
                 {
                     var now = DateTime.Now; double dt = Math.Min(0.5, (now - prev).TotalSeconds); prev = now;
@@ -845,7 +868,7 @@ static class Aurora3D
                         {
                             int b = px[si], g = px[si + 1], r = px[si + 2], a = Math.Max(r, Math.Max(g, b));
                             if (a == 0) { outb[di] = outb[di + 1] = outb[di + 2] = outb[di + 3] = 0; continue; }
-                            outb[di] = (byte)(b * 255 / a); outb[di + 1] = (byte)(g * 255 / a); outb[di + 2] = (byte)(r * 255 / a); outb[di + 3] = (byte)(a * 200 / 255);
+                            int ia = a << 8; outb[di] = unpm[ia + b]; outb[di + 1] = unpm[ia + g]; outb[di + 2] = unpm[ia + r]; outb[di + 3] = (byte)(a * 200 / 255);
                         }
                     }
                     var h = GCHandle.Alloc(outb, GCHandleType.Pinned);
@@ -857,7 +880,7 @@ static class Aurora3D
                             gr.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
                             // легенда сверху по центру
                             // две строки по 5: в одну легенда заезжала на часы слева
-                            var ws = legendParts.Select(p => gr.MeasureString(p.s + "   ", font, new PointF(0, 0), fmt).Width).ToArray();
+                            var ws = legendParts.Select(p => (float)TextBmp(p.s, p.c, font, fmt).Width + 14).ToArray();
                             for (int row = 0; row < 2; row++)
                             {
                                 int a0 = row * 5, a1 = Math.Min(legendParts.Count, a0 + 5); float lw = 0;
@@ -865,20 +888,23 @@ static class Aurora3D
                                 float lx = (W - lw) / 2;
                                 for (int i = a0; i < a1; i++) { var p = legendParts[i]; p.x = lx; p.y = 4 + row * 14; p.align = 0; labels.Add(p); lx += ws[i]; }
                             }
+                            gr.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceOver;
                             foreach (var l in labels)
                             {
-                                float x = l.x, tw = (l.align != 0) ? gr.MeasureString(l.s, font, new PointF(0, 0), fmt).Width : 0;
-                                if (l.align == 1) x -= tw; else if (l.align == 2) x -= tw / 2;
-                                foreach (var d in new[] { new[] { -1, 0 }, new[] { 1, 0 }, new[] { 0, -1 }, new[] { 0, 1 } }) gr.DrawString(l.s, font, shadow, x + d[0], l.y + d[1], fmt);
-                                using (var br = new SolidBrush(l.c)) gr.DrawString(l.s, font, br, x, l.y, fmt);
+                                var tb = TextBmp(l.s, l.c, font, fmt); float x = l.x - 1;
+                                if (l.align == 1) x -= tb.Width - 3; else if (l.align == 2) x -= (tb.Width - 3) / 2f;
+                                gr.DrawImageUnscaled(tb, (int)x, (int)l.y - 1);
                             }
                         }
                     }
                     finally { h.Free(); }
-                    pipe.Write(outb, 0, outb.Length);
+                    var tw0 = sw.Elapsed.TotalMilliseconds; pipe.Write(outb, 0, outb.Length); statW += sw.Elapsed.TotalMilliseconds - tw0;
                     frame++;
-                    long due = (long)(frame * 100) - sw.ElapsedMilliseconds;
-                    if (due > 0) Thread.Sleep((int)due); else if (due < -1000) { frame = sw.ElapsedMilliseconds / 100; }
+                    // 25 к/с (40 мс на кадр); раз в минуту — фактическая частота и время кадра в журнал
+                    long due = (long)(frame * 40) - sw.ElapsedMilliseconds;
+                    if (due > 0) Thread.Sleep((int)due); else if (due < -1000) { frame = sw.ElapsedMilliseconds / 40; }
+                    statN++; statMs += (DateTime.Now - now).TotalMilliseconds;
+                    if ((DateTime.Now - statT).TotalSeconds >= 20) { Log("кадров/с " + F(statN / (DateTime.Now - statT).TotalSeconds, "0.0") + ", кадр " + F(statMs / Math.Max(1, statN), "0.0") + " мс, из них запись в канал " + F(statW / Math.Max(1, statN), "0.0") + " мс"); statN = 0; statMs = 0; statW = 0; statT = DateTime.Now; }
                 }
             }
             catch (Exception e) { Log("выход: " + e.Message); }
