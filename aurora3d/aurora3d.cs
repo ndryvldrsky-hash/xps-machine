@@ -541,9 +541,10 @@ static class Aurora3D
     static double Yh(double h) { return -TR + Math.Max(0, Math.Min(1, h)) * HMAX; }
     static double N01(double v, double lo, double hi) { return double.IsNaN(v) ? 0 : Math.Max(0, Math.Min(1, (v - lo) / (hi - lo))); }
     // подпись в координатах грани i
-    // Подписи значений и устройств. «Наизнанку» — лучами (просьба пользователя): текстура в плоскости кромки снаружи,
-    // в полосе своих данных (x), тянется от столба наружу продолжением луча; на левой половине экрана развёрнута, чтобы
-    // читалась к центру. Сверху и снизу лучи могут уходить за кадр — так задумано. В обычной трубе — прежние 2D-подписи.
+    // Подписи значений и устройств — лучами (просьба пользователя): текстура в плоскости кромки снаружи, в полосе своих
+    // данных (x), тянется от контура наружу продолжением луча; на левой половине экрана развёрнута, чтобы читалась к
+    // центру. Сверху и снизу лучи могут уходить за кадр — так задумано. 22.09: лучами в обоих режимах — и «Наизнанку»
+    // (от столба, радиус LBR), и в обычной трубе (от кромки трубы, LBR = TR); прежние плоские 2D-подписи убраны.
     struct RayLabel { public int i; public double x; public string s; public Color c; }
     static readonly List<RayLabel> rays = new List<RayLabel>();
     static Font labelFont;
@@ -571,9 +572,7 @@ static class Aurora3D
     }
     static void LW(int i, double x, double y, double z, string s, Color c, int align, float dy)
     {
-        if (inside) { rays.Add(new RayLabel { i = i, x = x, s = s, c = c }); return; }
-        double a = WallAng(i), ca = Math.Cos(a), sa = Math.Sin(a); float px, py;
-        if (Proj(allM, x * ca - y * sa, x * sa + y * ca, z, 0, 0, W, H, out px, out py)) L(s, px, py + dy * SCF, c, align);
+        rays.Add(new RayLabel { i = i, x = x, s = s, c = c });
     }
     static void Vk(double x, double y, double z, Color c, double k) { V(x, y, z, c.R / 255.0 * k, c.G / 255.0 * k, c.B / 255.0 * k); }
     static void HueColor(double u, double v, out double r, out double g, out double b)
