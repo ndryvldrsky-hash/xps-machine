@@ -6,7 +6,7 @@
 2. «Алёна, …» или «Эй, Алёна, …»: детектор речи по громкости режет микрофон на фразы; первые 1,5 с каждой фразы уходят в GigaAM
    на Нуксе. Если там «Алёна» — сигнал, фраза пишется до паузы 1 с (макс. 25 с) и распознаётся целиком,
    обращение срезается, текст печатается в активное окно; если это VS Code (чат Claude Code со мной) — с Enter,
-   и тогда первые 1–2 фразы моего ответа проигрываются голосом (voice_reply.py на Нуксе, Piper, голос Ирины).
+   и тогда мой ответ целиком проигрывается голосом (правый Ctrl — перебить) (voice_reply.py на Нуксе, Piper, голос Ирины).
    (Vosk small-ru не подошёл: в его словаре нет имени «Алёна».)
 
 Распознавание локальное: Wyoming STT на Нуксе (аддон «Whisper», модель GigaAM v3 e2e через onnx-asr,
@@ -15,7 +15,7 @@
 Выключить режим «Алёна», не трогая диктовку: создать файл no_wake рядом со скриптом (проверяется каждую секунду).
 Запуск: задача планировщика «AlenaDictate» при входе rdpuser (pythonw). Лог — dictate.log рядом.
 """
-import collections, ctypes, datetime, json, os, queue, re, socket, threading, time, urllib.request, winsound
+import collections, ctypes, io, wave, datetime, json, os, queue, re, socket, threading, time, urllib.request, winsound
 
 import keyboard
 import numpy as np
@@ -91,7 +91,18 @@ def foreground_title() -> str:
 
 
 REPLY_URL = f"http://{HOST}:8123/local/voice_reply/"
-REPLY_WAIT_SEC = 180
+REPLY_WAIT_SEC = 1800     # ответ озвучивается целиком по концу моего хода — ход бывает долгим
+REPLY_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reply.wav")
+_reply_gen = [0]           # номер последней отправленной голосом фразы: новая фраза отменяет ожидание старого ответа
+_playing = [False]
+
+
+def stop_reply():
+    """Оборвать чтение ответа (правый Ctrl — перебить и сразу диктовать)."""
+    if _playing[0]:
+        _playing[0] = False
+        winsound.PlaySound(None, 0)
+        log("ответ голосом прерван")
 
 
 def norm(t):
@@ -104,8 +115,12 @@ def speak_reply(sent, t_sent):
     Ответ готовит voice_reply.py в аддоне на Нуксе: /local/voice_reply/voice_reply.json + WAV (голос Piper).
     Сопоставление — по началу отправленного текста в поле `for`."""
     key = norm(sent)[:40]
+    _reply_gen[0] += 1
+    gen = _reply_gen[0]
     deadline = time.time() + REPLY_WAIT_SEC
     while time.time() < deadline:
+        if gen != _reply_gen[0]:
+            return
         time.sleep(1.5)
         try:
             with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
@@ -117,12 +132,20 @@ def speak_reply(sent, t_sent):
         try:
             with urllib.request.urlopen(REPLY_URL + meta["wav"], timeout=10) as r:
                 data = r.read()
-            log(f"ответ голосом: {meta.get('text', '')}")
-            winsound.PlaySound(data, winsound.SND_MEMORY)
+            if gen != _reply_gen[0]:
+                return
+            with open(REPLY_WAV, "wb") as f:          # SND_ASYNC из памяти нельзя — через файл
+                f.write(data)
+            log(f"ответ голосом ({len(meta.get('text', ''))} симв.): {meta.get('text', '')[:120]}")
+            with wave.open(io.BytesIO(data)) as w:
+                dur = w.getnframes() / w.getframerate()
+            _playing[0] = True
+            winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            threading.Timer(dur + 0.5, lambda: _playing.__setitem__(0, False)).start()
         except Exception as e:
             log(f"не удалось проиграть ответ: {e!r}")
         return
-    log("ответ голосом не дождалась (3 мин)")
+    log("ответ голосом не дождалась (30 мин)")
 
 
 class Voice:
@@ -325,6 +348,7 @@ def main():
             v.last_key = time.time()
         if e.name == HOTKEY:
             if e.event_type == "down":
+                stop_reply()
                 v.key_start()
             else:
                 v.key_stop()
