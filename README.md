@@ -60,6 +60,11 @@ Frigate ушла в `unavailable`, а ffmpeg из `WebcamPush` вечно вис
 `New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero)` (плюс
 `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`), иначе через три дня всё повторится.
 
+**Консольные задачи в сессии `rdpuser` — через `conhost.exe --headless` (2026-09-24).** `WebcamPush`,
+`TextInputHostWatchdog` и `MediaMTX` запускаются как `W:\Windows\System32\conhost.exe --headless <программа>`:
+иначе `-WindowStyle Hidden` на миг показывает консоль, а `mediamtx.exe` напрямую держал постоянное окно
+Windows Terminal с логом. У `MediaMTX` рабочая папка `W:\mediamtx` (там `mediamtx.yml`), лог — `mediamtx.log`.
+
 
 ## Оверлей телеметрии (2026-09-14/15)
 
@@ -130,7 +135,7 @@ base64, ровно один BOM), обратно — `xps_get.py`.
   Сигнал (водопад), Вектор (тоннель), Свет и Движение, Линии (улица, дом), Свечение (рамка: CPU XPS до TjMax / детектор
   Frigate), Наборы (4 ядра, 8 каналов электричества), Направления (ветер, движение в кадре — стрелки в тоннеле),
   События (люди на камерах, SMS, обрыв связи с HA, падение VPN), Состояния (Андрей, бойлер, блокировка XPS, VPN),
-  Потоки (частицы: сеть/диск XPS, WAN Оптиплекса, VPN телефона). Данные HA — MQTT `alena/aurora/data` (автоматизация
+  Потоки (частицы: сеть/диск XPS, WAN Нукса, VPN телефона). Данные HA — MQTT `alena/aurora/data` (автоматизация
   aurora_data_publish; логин/адрес — из appsettings.json HASS.Agent). **Кнопки** — поддельный ONVIF на :8099 (urlacl
   для rdpuser, брандмауэр только 100.64.0.0/10 и 192.168.77.0/24): во Frigate у XPS панель PTZ, пресеты = переключатели
   грамматик (+ «Всё включить/выключить», «Сброс вида»), стрелки/зум — поворот и приближение 3D-сцен; состояние —

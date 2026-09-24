@@ -10,7 +10,7 @@
 //   Направления      — направление и сила → стрелки в тоннеле: ветер (HA), куда движется картинка в кадре;
 //   События          — вспышки на оси времени: люди на камерах Frigate, SMS, обрыв связи с HA, падение VPN;
 //   Состояния        — дорожки под осью времени: Андрей снаружи, бойлер, блокировка XPS, VPN;
-//   Потоки           — частицы, скорость ∝ объёму: сеть и диск XPS, WAN Оптиплекса, VPN телефона.
+//   Потоки           — частицы, скорость ∝ объёму: сеть и диск XPS, WAN Нукса, VPN телефона.
 // Входы: собственный ffmpeg из чистого xps_sub (160x90 yuv444p 25 к/с); MQTT alena/aurora/data от HA (автоматизация
 //   aurora_data_publish; логин/адрес берутся из appsettings.json HASS.Agent — пароль не дублируется); термо-лог
 //   W:\ThermalLog\latest.json; счётчики Windows; пинг HA.
@@ -307,7 +307,7 @@ static class Aurora3D
                         Add("st_andrey", B(m, "andrey_out") ? 1 : 0, now); Add("st_boiler", B(m, "boiler") ? 1 : 0, now); Add("st_vpn", B(m, "vpn") ? 1 : 0, now);
                         var el = m.ContainsKey("elec") ? m["elec"] as Dictionary<string, object> : null;
                         if (el != null) { elecHist.Insert(0, new SetSlice { t = now, v = elecNames.Select(n => D(el, n, 0)).ToArray() }); if (elecHist.Count > 21) elecHist.RemoveAt(21); }
-                        flows["WAN Оптиплекса"] = D(m, "opt_wan_rx", 0); flows["VPN телефона"] = D(m, "vpn_down_kbs", 0) * 1024;
+                        flows["WAN Нукса"] = D(m, "opt_wan_rx", 0); flows["VPN телефона"] = D(m, "vpn_down_kbs", 0) * 1024;
                     }
                     Add("st_locked", locked ? 1 : 0, now);
                     flows["Сеть XPS"] = net; flows["Диск XPS"] = dw;
@@ -952,13 +952,16 @@ static class Aurora3D
     }
     static readonly object camLock = new object();
     // аура-таблички: overlay.png пишет overlay_render.ps1 (2 раза в секунду) — перечитываем по времени изменения
-    static byte[] auraBgra; static volatile bool auraNew = false; static DateTime auraT = DateTime.MinValue; static volatile bool auraLoading = false;
+    static byte[] auraBgra; static volatile bool auraNew = false; static DateTime auraT = DateTime.MinValue; static volatile bool auraLoading = false; static DateTime auraLoadStart = DateTime.MinValue;
     static void AuraCheck()
     {
         const string f = @"W:\ffmpeg\overlay\overlay.png";
         DateTime t; try { t = File.GetLastWriteTimeUtc(f); } catch { return; }
+        // 24.09.2026: загрузка могла зависнуть навсегда (флаг auraLoading не снимался) — слой ауры застывал на
+        // часы, пока текст в overlay.png обновлялся. Висит дольше 5 с — считаем пропавшей и грузим заново.
+        if (auraLoading && (DateTime.UtcNow - auraLoadStart).TotalSeconds > 5) { auraLoading = false; auraT = DateTime.MinValue; Log("аура: загрузка слоя зависла — перезапуск"); }
         if (t == auraT || auraLoading) return;
-        auraLoading = true; auraT = t;
+        auraLoading = true; auraT = t; auraLoadStart = DateTime.UtcNow;
         ThreadPool.QueueUserWorkItem(_ =>
         {
             try
