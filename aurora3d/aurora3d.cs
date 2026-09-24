@@ -1,4 +1,4 @@
-// «Аврора 3D» (2026-09-21): вся аврора камеры XPS на видеокарте (OpenGL, NVIDIA GT 640M) — слой для webcam_push.ps1.
+﻿// «Аврора 3D» (2026-09-21): вся аврора камеры XPS на видеокарте (OpenGL, NVIDIA GT 640M) — слой для webcam_push.ps1.
 // «Грамматика авроры»: стиль отображения выбирается по роду данных, каждая грамматика включается кнопкой (пресетом
 // PTZ во Frigate — встроенный поддельный ONVIF, см. ниже):
 //   Сигнал           — распределение по кадру → «водопад»: рельеф средней яркости по столбцам, 20 с в глубину;
@@ -1061,8 +1061,30 @@ static class Aurora3D
                 pipe = new NamedPipeServerStream("aurora3d", PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.None, 0, W * H * 5 / 2);
                 pipe.WaitForConnection();
                 Log("читатель подключился");
+                // 24.09.2026: писатель канала — отдельный поток, ровно 25 к/с последним готовым кадром (повтор, если рисование
+                // не успело). Раньше запись шла из цикла рисования: при 14–18 к/с (XPS под нагрузкой, считывание с GPU 30–40 мс)
+                // ffmpeg камеры ждал слой на 25 к/с, отставал от реального времени и копил кадры камеры в памяти —
+                // 11 ГБ за 50 минут, память XPS 97 %. Теперь для ffmpeg слой всегда идёт в реальном времени.
+                var latest = new byte[outb.Length]; var outLock = new object(); bool writerFail = false; var wpipe = pipe;
+                var writer = new Thread(() =>
+                {
+                    var wbuf = new byte[latest.Length]; var ws = Stopwatch.StartNew(); long wn = 0;
+                    try
+                    {
+                        while (wpipe.IsConnected)
+                        {
+                            lock (outLock) Buffer.BlockCopy(latest, 0, wbuf, 0, wbuf.Length);
+                            wpipe.Write(wbuf, 0, wbuf.Length);
+                            wn++; long wdue = wn * 40 - ws.ElapsedMilliseconds;
+                            if (wdue > 0) Thread.Sleep((int)wdue); else if (wdue < -1000) wn = ws.ElapsedMilliseconds / 40;
+                        }
+                    }
+                    catch (Exception e) { Log("писатель: " + e.Message); }
+                    writerFail = true;
+                }) { IsBackground = true };
+                writer.Start();
                 var sw = Stopwatch.StartNew(); long frame = 0; int statN = 0; double statMs = 0, statW = 0, stDraw = 0, stLab = 0, stPost = 0, stComp = 0; DateTime statT = DateTime.Now;
-                while (pipe.IsConnected)
+                while (pipe.IsConnected && !writerFail)
                 {
                     var now = DateTime.Now; double dt = Math.Min(0.5, (now - prev).TotalSeconds); prev = now;
                     lock (lk) { yaw += vYaw * dt * 1.2; pitch = Math.Max(-1.2, Math.Min(1.2, pitch + vPitch * dt * 0.8)); zoom = Math.Max(0.4, Math.Min(3, zoom * Math.Exp(vZoom * dt))); }
@@ -1108,7 +1130,7 @@ static class Aurora3D
                         try { if (encIn != null) encIn.Write(compb, 0, compb.Length); } catch (Exception e) { Log("кодер: запись — " + e.Message); try { encProc.Kill(); } catch { } encProc = null; }
                         stComp += sw.Elapsed.TotalMilliseconds - tD;
                     }
-                    var tw0 = sw.Elapsed.TotalMilliseconds; pipe.Write(outb, 0, outb.Length); statW += sw.Elapsed.TotalMilliseconds - tw0;
+                    var tw0 = sw.Elapsed.TotalMilliseconds; lock (outLock) { var tb2 = latest; latest = outb; outb = tb2; } statW += sw.Elapsed.TotalMilliseconds - tw0;   // кадр — писателю (обмен буферами)
                     frame++;
                     // 25 к/с (40 мс на кадр); раз в минуту — фактическая частота и время кадра в журнал
                     long due = (long)(frame * 40) - sw.ElapsedMilliseconds;
