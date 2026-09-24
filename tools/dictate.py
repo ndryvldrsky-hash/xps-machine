@@ -303,7 +303,8 @@ class Voice:
                 if text:
                     text = text[0].upper() + text[1:]
             title = foreground_title()
-            send = wake and "Visual Studio Code" in title
+            # чат Claude Code: десктопный VS Code или Studio Code Server в браузере
+            send = wake and any(k in title for k in ("Visual Studio Code", "Studio Code Server"))
             log(f"{'Алёна' if wake else 'клавиша'}: {dur:.1f} с → {took:.1f} с, окно «{title[:60]}»{' +Enter' if send else ''}: {text}")
             if not text:
                 return
