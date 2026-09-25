@@ -62,14 +62,120 @@ MOTIFS_UP = [("Штраус, «Заратустра»", ((60, 2), (67, 2), (72, 
 MOTIFS_DOWN = [("Григ, «Утро»", ((79, 1), (76, 1), (74, 1), (72, 2))),
                ("Дворжак, Ларго", ((64, 2), (67, 1), (67, 2), (64, 2), (62, 1), (60, 2))),
                ("Бетховен, «К Элизе»", ((76, 1), (75, 1), (76, 1), (71, 1), (74, 1), (72, 1), (69, 2))),
-               ("Бах, «Шутка»", ((71, 1), (74, 1), (71, 1), (66, 1), (71, 2)))]
+               ("Бах, «Шутка»", ((71, 1), (74, 1), (71, 1), (66, 1), (71, 2))),
+               # 26.09 «добавь нисходящих» (длинные, для «отправлено»)
+               ("Пахельбель, «Канон»", ((78, 2), (76, 2), (74, 2), (73, 2), (71, 2), (69, 3))),
+               ("Бах, Токката и фуга ре минор", ((69, 1), (67, 1), (69, 3), (67, 1), (65, 1), (64, 1), (62, 1), (61, 2), (62, 3))),
+               ("Бетховен, Пятая симфония", ((67, 1), (67, 1), (67, 1), (63, 4), (65, 1), (65, 1), (65, 1), (62, 4)))]
 NOTE_UNIT = 0.09
+# 26.09 «инструмент, который звуком ниже»: сурбахар (бас-ситар) — всё на октаву вниз, щипок мягче (толстая струна).
+# TRANSPOSE — сдвиг в полутонах (0 — ситар, −12 — сурбахар), PLUCK — яркость щипка (доля «сырого» шума, ситар 0,7)
+TRANSPOSE = -12
+PLUCK = 0.45
+# 26.09 «что-нибудь низкое, похожее на виолончель»: INSTRUMENT = "cello" — смычковый синтез (см. _cello);
+# "sitar" — щипковый (Карплус–Стронг + джавари + тараб), с TRANSPOSE −12 — сурбахар
+INSTRUMENT = "sf2_sitar"    # 26.09 ситар из SF2 (до этого "vsco_harp" — «давай арфу», ещё раньше "vsco_cello")
+# Живые сэмплы VSCO-2 CE (CC0, Versilian Studios; скачаны на XPS в samples\<папка>, не в git). У инструмента: папка,
+# маска файлов, сдвиг октавы в имени (виолончель: «C1» = 65 Гц → +2; арфа — научная нумерация → +1), легато
+# (смычок: нота до следующей) или звон (щипок: ноты звенят поверх друг друга), темп «слушаю»/«отправлено», транспозиция.
+# Пока сэмплы грузятся (первые доли секунды после старта) — синтез "cello".
+VSCO_INST = {
+    "vsco_cello": {"dir": "cello_susvib", "mask": "susvib_*_v1_1.wav", "oct": 2, "legato": True, "tempo": (1.15, 1.6), "tr": -12},
+    "vsco_harp": {"dir": "harp", "mask": "KSHarp_*.wav", "oct": 1, "legato": False, "tempo": (1.0, 1.3), "tr": 0},
+    # ситар: 105-Sitar.sf2 (musical-artifacts #3847, общественное достояние, Dr. Narayan Bhagawan Raikar), разобран
+    # в аддоне HA на 26 нот MIDI 36–79 → samples\\sitar\\sitar_<midi>.wav (имя — сразу номер MIDI, признак "midi")
+    "sf2_sitar": {"dir": "sitar", "mask": "sitar_*.wav", "midi": True, "legato": False, "tempo": (1.0, 1.3), "tr": 0},
+}
+VSCO_DIR = os.path.join(HERE, "samples")
+_vsco = {}                  # midi → моно float32 при BEEP_SR (текущего инструмента)
+
+
+def _vsco_load():
+    import glob as _glob
+    cfg = VSCO_INST[INSTRUMENT]
+    names = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+    for p in sorted(_glob.glob(os.path.join(VSCO_DIR, cfg["dir"], cfg["mask"]))):
+        nm = os.path.splitext(os.path.basename(p))[0].split("_")[1]   # «A2», «C1»… или сразу номер MIDI
+        midi = int(nm) if cfg.get("midi") else 12 * (int(nm[1:]) + cfg["oct"]) + names[nm[0]]
+        w = wave.open(p); ch, sw, sr, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = w.readframes(min(n, int(sr * 3.0))); w.close()  # хватает первых 3 с
+        if sw == 3:
+            a = np.frombuffer(raw, np.uint8).reshape(-1, 3)
+            x = a[:, 0].astype(np.int32) | (a[:, 1].astype(np.int32) << 8) | (a[:, 2].astype(np.int32) << 16)
+            x = np.where(x & 0x800000, x - 0x1000000, x) / 8388608.0
+        else:
+            x = np.frombuffer(raw, "<i2") / 32768.0
+        x = x.reshape(-1, ch).mean(axis=1)
+        k = int(np.argmax(np.abs(x) > 0.02 * np.abs(x).max()))  # без тишины в начале
+        x = x[max(0, k - int(0.005 * sr)):]
+        t = np.arange(0, len(x) * BEEP_SR / sr) * sr / BEEP_SR   # 44,1 → 48 кГц
+        _vsco[midi] = np.interp(t, np.arange(len(x)), x).astype(np.float32)
+    log(f"сэмплы VSCO ({INSTRUMENT}): загружено {len(_vsco)} нот")
+
+
+def _vsco_render(notes, onsets, n, last=0.7):
+    out = np.zeros(n)
+    for k, f in enumerate(notes):
+        target = 69 + 12 * np.log2(f / 440)
+        src = min(_vsco, key=lambda m: abs(m - target))
+        x = _vsco[src]
+        rate = 2 ** ((target - src) / 12)
+        d = int(onsets[k] * BEEP_SR)
+        if VSCO_INST[INSTRUMENT]["legato"]:
+            dur = (onsets[k + 1] - onsets[k] + 0.06) if k + 1 < len(notes) else last
+        else:
+            dur = n / BEEP_SR - onsets[k]                   # щипок: нота звенит до конца сигнала
+        m = min(n - d, int((dur + 0.18) * BEEP_SR), int(len(x) / rate) - 1)
+        y = np.interp(np.arange(m) * rate, np.arange(len(x)), x)
+        env = np.ones(m)
+        a = min(m, int(0.012 * BEEP_SR)); env[:a] = np.linspace(0, 1, a)       # без щелчка
+        rel = int(dur * BEEP_SR)
+        if rel < m:
+            env[rel:] *= np.linspace(1, 0, m - rel) ** 1.5                     # снятие смычка / переход к следующей
+        out[d:d + m] += y * env
+    return out
+
+
+def _cello(notes, onsets, n, rng):
+    """Смычковая «виолончель»: у ноты 24 гармоники ~1/k (как пилообразная волна) с окраской корпуса (подъём около 250
+    и 600 Гц, спад выше 2,5 кГц), атака смычка 70 мс, вибрато 5,5 Гц ±0,5 % через 0,15 с, лёгкий шум смычка; ноты легато —
+    каждая тянется до вступления следующей (+40 мс перекрытия), последняя — 0,45 с, затухание 0,15 с."""
+    out = np.zeros(n)
+    for k, f in enumerate(notes):
+        d = int(onsets[k] * BEEP_SR)
+        dur = (onsets[k + 1] - onsets[k] + 0.04) if k + 1 < len(notes) else 0.45
+        m = min(n - d, int((dur + 0.15) * BEEP_SR))
+        t = np.arange(m) / BEEP_SR
+        vib = 1 + 0.005 * np.sin(2 * np.pi * 5.5 * t) * np.clip((t - 0.15) / 0.12, 0, 1)
+        ph = 2 * np.pi * f * np.cumsum(vib) / BEEP_SR
+        w = np.zeros(m)
+        for h in range(1, 25):
+            hf = h * f
+            if hf > BEEP_SR / 2.2:
+                break
+            g = (1 / h) / (1 + (hf / 2500) ** 2) * (1 + 0.8 * np.exp(-((hf - 250) / 120) ** 2) + 0.5 * np.exp(-((hf - 600) / 250) ** 2))
+            w += g * np.sin(h * ph + 0.3 * h)
+        w += 0.02 * np.convolve(rng.standard_normal(m), np.ones(8) / 8, mode="same")   # шум смычка
+        env = np.clip(t / 0.07, 0, 1) ** 1.3                                          # атака смычка
+        rel = int(dur * BEEP_SR)
+        if rel < m:
+            env[rel:] *= np.linspace(1, 0, m - rel)                                   # снятие смычка
+        out[d:d + m] += w * env
+    return out
 # 26.09 «гаммы-ситара тоже оставь»: раги (Билавал, Бхупали, Дурга, Кафи) в тех же кругах, чередуясь с мотивами:
 # вверх от C5 — к «слушаю», вниз к C4 — к «отправлено»; темп гамм — 50 мс на ноту (NOTE_STEP / NOTE_UNIT долей)
 _RAGA_FIG = [("Билавал", (0, 2, 4, 7)), ("Бхупали", (0, 2, 4, 7, 9)), ("Дурга", (0, 2, 5, 7, 9)), ("Кафи", (0, 2, 3, 7))]
 _g = 0.05 / NOTE_UNIT
-MOTIFS_UP = [m for pair in zip(MOTIFS_UP, [(f"рага {n}", tuple((72 + x, _g) for x in fig)) for n, fig in _RAGA_FIG]) for m in pair]
-MOTIFS_DOWN = [m for pair in zip(MOTIFS_DOWN, [(f"рага {n}", tuple((60 + x, _g) for x in reversed(fig))) for n, fig in _RAGA_FIG]) for m in pair]
+from itertools import zip_longest as _zl   # чередование без потерь (zip обрезал по короткому списку — мотивы сверх 4 пропадали)
+MOTIFS_UP = [m for pair in _zl(MOTIFS_UP, [(f"рага {n}", tuple((72 + x, _g) for x in fig)) for n, fig in _RAGA_FIG]) for m in pair if m]
+MOTIFS_DOWN = [m for pair in _zl(MOTIFS_DOWN, [(f"рага {n}", tuple((60 + x, _g) for x in reversed(fig))) for n, fig in _RAGA_FIG]) for m in pair if m]
+# 26.09 «короткие в начало, длинные в конец»: наборы пересобраны по длине, а не по направлению — «слушаю» звучит,
+# когда микрофон уже пишет, поэтому туда только короткие (ноты укладываются в ≤0,5 с), длинные — на «отправлено»
+_span = lambda m: sum(ln for _n, ln in m[1][:-1]) * NOTE_UNIT
+# … и «те, которые не совпадают по направлению, убрать»: «слушаю» — короткие ВОСХОДЯЩИЕ, «отправлено» — длинные
+# НИСХОДЯЩИЕ; короткие нисходящие и длинные восходящие не звучат
+MOTIFS_UP = [m for m in MOTIFS_UP if _span(m) <= 0.5]      # «слушаю» — короткие восходящие
+MOTIFS_DOWN = [m for m in MOTIFS_DOWN if _span(m) > 0.5]   # «отправлено» — длинные нисходящие
 _motif = {1200: [len(MOTIFS_UP) - 1], 700: [len(MOTIFS_DOWN) - 1]}
 
 
@@ -116,19 +222,41 @@ def _soft_tone(fr, ms, raga=None):
     Карплуса–Стронга с жужжанием джавари (мягкое насыщение tanh) и тихие резонансные струны тараб на тех же нотах
     октавой выше, вступающие через 60 мс с долгим звоном. Длина 0,9 с; звуки просчитываются один раз (кэш)."""
     idx = (_motif[fr][0] if raga is None else raga) if fr in (1200, 700) else -1
-    key = (fr, idx)   # длительность не используется — звук целиком задаётся нотами
+    key = (fr, idx, INSTRUMENT in VSCO_INST and bool(_vsco))   # живые сэмплы / синтез до их загрузки
     if key in _tone_cache:
         return _tone_cache[key]
     if idx >= 0:
         notes, onsets = _motif_notes(fr, idx)
     else:
         notes = CHORDS.get(fr, (fr,)); onsets = tuple(NOTE_STEP * k for k in range(len(notes)))
+    live = INSTRUMENT in VSCO_INST and bool(_vsco)
+    if live:   # «слушаю» — микрофон уже пишет: темп быстрее и короткая последняя нота (≈0,8 с); «отправлено» — полностью
+        tp = VSCO_INST[INSTRUMENT]["tempo"]
+        onsets = tuple(o * (tp[1] if fr != 1200 else tp[0]) for o in onsets)
+    tr = VSCO_INST[INSTRUMENT]["tr"] if INSTRUMENT in VSCO_INST else TRANSPOSE
+    notes = tuple(f * 2 ** (tr / 12) for f in notes)            # сдвиг регистра инструмента (сурбахар/виолончель −12)
     n = int(BEEP_SR * (onsets[-1] + 0.75))
     rng = np.random.default_rng(11)
     out = np.zeros(n)
+    if live:
+        last = (0.3 if fr == 1200 else 0.7) if VSCO_INST[INSTRUMENT]["legato"] else (0.45 if fr == 1200 else 1.1)
+        n = int(BEEP_SR * (onsets[-1] + last + 0.25))
+        out = _vsco_render(notes, onsets, n, last)
+        fade = int(0.05 * BEEP_SR)
+        out[-fade:] *= np.linspace(1, 0, fade)
+        out = BEEP_VOL * out / max(1e-6, np.abs(out).max()) * 0.8
+        _tone_cache[key] = out.astype(np.float32)
+        return _tone_cache[key]
+    if INSTRUMENT == "cello" or INSTRUMENT in VSCO_INST:
+        out = _cello(notes, onsets, n, rng)
+        fade = int(0.05 * BEEP_SR)
+        out[-fade:] *= np.linspace(1, 0, fade)
+        out = BEEP_VOL * out / max(1e-6, np.abs(out).max()) * 0.8
+        _tone_cache[key] = out.astype(np.float32)
+        return _tone_cache[key]
     for k, f in enumerate(notes):                                 # ноты по очереди, прежние ещё звенят
         d = int(onsets[k] * BEEP_SR)
-        s1 = _ks(f, n - d, 0.995, rng, 0.7) * (0.8 if k < len(notes) - 1 else 1.0)
+        s1 = _ks(f, n - d, 0.995, rng, PLUCK) * (0.8 if k < len(notes) - 1 else 1.0)
         s1 = 0.55 * s1 + 0.45 * np.tanh(3.0 * s1) / np.tanh(3.0)   # джавари: «жужжание» подставки
         out[d:] += s1
     dl = int(onsets[-1] * BEEP_SR) + int(0.06 * BEEP_SR)          # тараб на последней ноте — долгий звон
@@ -142,6 +270,11 @@ def _soft_tone(fr, ms, raga=None):
 
 # прогрев: все сигналы просчитываются в фоне при старте, чтобы первый же не опаздывал на ~0,2 с
 def _warm():
+    if INSTRUMENT in VSCO_INST:
+        try:
+            _vsco_load()
+        except Exception as e:
+            log(f"сэмплы VSCO не загрузились, играет синтез: {e!r}")
     for f in CHORDS:
         _soft_tone(f, 0)
     for i in range(len(MOTIFS_UP)):      # все мотивы (индекс передаётся явно — без гонки с beep)
