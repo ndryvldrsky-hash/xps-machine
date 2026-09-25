@@ -87,15 +87,26 @@ foreach ($f in ($procs | ? { $_.Name -eq "ffmpeg.exe" -and $_.CommandLine -match
     }
 }
 
-# DeviceAssociationService: Idle + EcoQoS + потолок 3 % CPU
+# DeviceAssociationService: Idle + EcoQoS; БЕЗ жёсткого потолка CPU.
+# 24.09 23:30: потолок 3 % через Job Object оказался ошибкой — служба крутит бесконечный поиск пропавшего устройства,
+# с потолком не успевала разбирать свою очередь и раздулась до 32 ГБ памяти: кончился файл подкачки, WinRM не стартовал,
+# камера не открылась. Теперь — только низкий приоритет и режим эффективности, плюс страховка по памяти: > 500 МБ →
+# процесс службы завершается (Windows поднимает службу заново). Уже попавший в задание процесс лечится только перезапуском.
 $svc = Get-CimInstance Win32_Service -Filter "Name='DeviceAssociationService'"
 if ($svc -and $svc.ProcessId) {
     $sp = $procs | ? { $_.ProcessId -eq $svc.ProcessId }
     if ($sp) {
         Set-Prio $sp "Idle" "DeviceAssociationService"
-        $r = [Guard]::CapCpu([int]$svc.ProcessId, "AlenaCap_DeviceAssociation", 3)
-        if ($r -eq 1) { Log "DeviceAssociationService (PID $($svc.ProcessId)): потолок CPU 3 % (Job Object)" }
-        elseif ($r -lt 0) { Log "DeviceAssociationService (PID $($svc.ProcessId)): потолок не поставлен, ошибка $(-$r)" }
-        if ($r -eq 1) { if ([Guard]::Eco([int]$svc.ProcessId)) { Log "DeviceAssociationService: режим эффективности" } }
+        $mb = [int]((Get-Process -Id $svc.ProcessId -ErrorAction SilentlyContinue).PrivateMemorySize64 / 1MB)
+        if ($mb -gt 500) {
+            Log "DeviceAssociationService (PID $($svc.ProcessId)): $mb МБ > 500 — перезапуск процесса службы"
+            Stop-Process -Id $svc.ProcessId -Force -ErrorAction SilentlyContinue
+        } else {
+            $flag = "$dir\eco_$($svc.ProcessId).flag"
+            if (-not (Test-Path $flag)) {
+                if ([Guard]::Eco([int]$svc.ProcessId)) { Log "DeviceAssociationService (PID $($svc.ProcessId)): режим эффективности" }
+                Set-Content $flag "1"; Get-ChildItem "$dir\eco_*.flag" | ? { $_.Name -ne "eco_$($svc.ProcessId).flag" } | Remove-Item -Force
+            }
+        }
     }
 }

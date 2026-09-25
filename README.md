@@ -262,3 +262,14 @@ Dedicated Usage > 0). Блок скопов сужен до 180 px, чтобы �
 
 В `webcam_push.ps1` у всех выходов `-thread_queue_size 16`, а выход в `\\.\pipe\aurora_cam` включается, только если
 нет `W:\tools\aurora3d\composite_off.txt` — без этого ffmpeg под нагрузкой копил кадры до 6–11 ГБ.
+
+## Облегчённый режим: отрисовка на Нуксе (2026-09-24)
+
+Файл `W:\ffmpeg\lean_mode.txt` включает в `webcam_push.ps1` облегчённый режим: XPS только снимает камеру (1080p MJPEG
+25 к/с) и отдаёт два потока аппаратным h264_mf — `xps_cam` 1080p 25 к/с 4 Мбит/с и `xps_sub` 640x360 10 к/с. Аура,
+Аврора и варианты частоты собираются на Нуксе (`aura_overlay.sh` + `aurora/aurora_nuks.py` в репо frigate-fa), кнопки
+Авроры — `aurora_ctl.py` (ONVIF :8097). Задача Aurora3D отключена. Возврат к прежней схеме: удалить `lean_mode.txt`,
+включить Aurora3D, в Frigate вернуть источники `xps`/`xps_aurora`/`xps_b*` на `rtsp://100.64.161.4:8554/...`.
+
+**24.09 23:30:** служба `DeviceAssociationService` отключена (реестр `Start=4`): под потолком CPU из ProcGuard она
+раздулась до 32 ГБ и выела файл подкачки. Потолок CPU в ProcGuard убран. Для сопряжения новых устройств — вернуть `Start=2`.

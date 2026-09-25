@@ -30,7 +30,7 @@ MIN_SEC = 0.3
 LOG = os.path.join(HERE, "dictate.log")
 NO_WAKE = os.path.join(HERE, "no_wake")
 DEBUG = os.path.exists(os.path.join(HERE, "debug_wake"))   # подробный лог Vosk: создать файл debug_wake
-WAKE_RE = re.compile(r"^\s*(?:(?:эй|хей|ну)[\s,.!?:—-]+)?[ао]л[её]н(?:а|у|ушка|очка|ка)?\b[\s,.!?:—-]*", re.I)   # «Алёна», «Эй, Алёна»
+WAKE_RE = re.compile(r"^\s*(?:(?:эй|хей|ну|о['’]?кей|ок)[\s,.!?:—-]+)?[ао]л[её]н(?:а|у|ушка|очка|ка)?\b[\s,.!?:—-]*", re.I)   # «Алёна», «Эй/Окей, Алёна»
 PRE_ROLL_SEC = 0.3               # звук до начала речи, чтобы не съесть первый слог
 PROBE_SEC = 1.5                  # сколько начала фразы отправить на проверку «Алёна»
 MIN_VOICED_SEC = 0.4             # меньше «голосовых» 30-мс блоков в начале фразы — щелчок/шум, пробу не шлём
@@ -45,10 +45,38 @@ def log(msg):
         f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
 
 
+# 26.09 (просьба пользователя «более мягкий звук, чем писк»): вместо winsound.Beep (прямоугольный писк полной громкости) —
+# синусоида с плавным нарастанием/затуханием, тише и ниже; частоты сдвинуты вниз с сохранением смысла сигналов
+# (высокий — слушаю, средний — отправлено, низкий — ошибка). Играет через sounddevice, не через PlaySound —
+# не обрывает голосовой ответ Алёны.
+SOFT = {1200: 880, 700: 587, 300: 262, 500: 494, 400: 392}   # старая частота → мягкая (ля5, ре5, до4, си4, соль4)
+BEEP_VOL = 0.12
+BEEP_SR = 48000
+
+
+def _soft_tone(fr, ms):
+    n = int(BEEP_SR * max(ms, 90) / 1000)
+    t = np.arange(n) / BEEP_SR
+    w = np.sin(2 * np.pi * fr * t) + 0.15 * np.sin(4 * np.pi * fr * t)   # чуть второй гармоники — «тёплее», не свист
+    env = np.ones(n)
+    a, r = int(0.015 * BEEP_SR), int(0.06 * BEEP_SR)
+    env[:a] = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, a))                # плавное нарастание 15 мс
+    env[-r:] = 0.5 + 0.5 * np.cos(np.linspace(0, np.pi, r))               # плавное затухание 60 мс
+    return (BEEP_VOL / 1.15 * w * env).astype(np.float32)
+
+
 def beep(*tones):
     def run():
-        for fr, ms in tones:
-            winsound.Beep(fr, ms)
+        try:
+            gap = np.zeros(int(0.03 * BEEP_SR), np.float32)
+            parts = []
+            for fr, ms in tones:
+                parts += [_soft_tone(SOFT.get(fr, fr), ms), gap]
+            sd.play(np.concatenate(parts), BEEP_SR, blocking=True)
+        except Exception as e:   # нет устройства вывода — прежний писк лучше тишины
+            log(f"мягкий сигнал не сыграл: {e!r}")
+            for fr, ms in tones:
+                winsound.Beep(fr, ms)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -239,7 +267,9 @@ class Voice:
             self.noise = 0.97 * self.noise + 0.03 * max(rms, 1.0)     # фон учим только вне речи
         if self.seg is None:
             self.ring.append(block)
-            if voiced and self.wake_enabled and not self.rec and not self.busy and now - self.last_key > KEY_QUIET_SEC:
+            # 24.09: не слушать «Алёну», пока играет голосовой ответ (+0,5 с): клиент слышал ответ из динамиков и слал каждую
+            # его фразу пробой в GigaAM — аддон Whisper на Нуксе ел 600 % CPU (петля эха). Прервать ответ — правый Ctrl.
+            if voiced and self.wake_enabled and not self.rec and not self.busy and not _playing[0] and now - self.last_key > KEY_QUIET_SEC:
                 self.voiced_n = 0
                 self.seg = list(self.ring)               # 0,3 с до начала речи
                 self.seg_t0 = now
