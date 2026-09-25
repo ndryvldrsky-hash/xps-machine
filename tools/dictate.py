@@ -47,32 +47,234 @@ def log(msg):
 
 # 26.09 (просьба пользователя «более мягкий звук, чем писк»): вместо winsound.Beep (прямоугольный писк полной громкости) —
 # синусоида с плавным нарастанием/затуханием, тише и ниже; частоты сдвинуты вниз с сохранением смысла сигналов
-# (высокий — слушаю, средний — отправлено, низкий — ошибка). Играет через sounddevice, не через PlaySound —
-# не обрывает голосовой ответ Алёны.
-SOFT = {1200: 880, 700: 587, 300: 262, 500: 494, 400: 392}   # старая частота → мягкая (ля5, ре5, до4, си4, соль4)
-BEEP_VOL = 0.12
+# (высокий — слушаю, средний — отправлено, низкий — ошибка). Играет через winsound.PlaySound (WAV в памяти) — тем же
+# путём, что голосовые ответы: sounddevice (PortAudio) выбирал не то устройство, на мониторе SHARP HDMI сигнал
+# не звучал. Сигнал может оборвать играющий ответ — но он звучит только на нажатие/речь, а они и так прерывают ответ.
+# 26.09 «ещё мягче… аккордом… ситар»: каждый сигнал — аккорд перебором на «ситаре» (см. _soft_tone). Смысл прежний: слушаю — до мажор, отправлено — фа мажор, ошибка — ля минор,
+# «Алёна» не подтвердилась — ре минор.
+# 26.09 «гаммы классиков… разделить на убывающее и возрастающее»: «слушаю» — восходящий мотив, «отправлено» —
+# нисходящий; каждый набор идёт по кругу независимо, ритм из оригинала (длительность в долях NOTE_UNIT), играет «ситар».
+# Ошибка и «не Алёна» — постоянные. Ноты — MIDI (60 = C4).
+MOTIFS_UP = [("Штраус, «Заратустра»", ((60, 2), (67, 2), (72, 3))),
+             ("Бетховен, «Ода к радости»", ((64, 1), (64, 1), (65, 1), (67, 2))),
+             ("Моцарт, «Маленькая ночная серенада»", ((67, 2), (62, 1), (67, 1), (71, 1), (74, 2))),
+             ("Григ, «Утро» (подъём)", ((74, 1), (76, 1), (79, 1), (81, 2)))]
+MOTIFS_DOWN = [("Григ, «Утро»", ((79, 1), (76, 1), (74, 1), (72, 2))),
+               ("Дворжак, Ларго", ((64, 2), (67, 1), (67, 2), (64, 2), (62, 1), (60, 2))),
+               ("Бетховен, «К Элизе»", ((76, 1), (75, 1), (76, 1), (71, 1), (74, 1), (72, 1), (69, 2))),
+               ("Бах, «Шутка»", ((71, 1), (74, 1), (71, 1), (66, 1), (71, 2)))]
+NOTE_UNIT = 0.09
+# 26.09 «гаммы-ситара тоже оставь»: раги (Билавал, Бхупали, Дурга, Кафи) в тех же кругах, чередуясь с мотивами:
+# вверх от C5 — к «слушаю», вниз к C4 — к «отправлено»; темп гамм — 50 мс на ноту (NOTE_STEP / NOTE_UNIT долей)
+_RAGA_FIG = [("Билавал", (0, 2, 4, 7)), ("Бхупали", (0, 2, 4, 7, 9)), ("Дурга", (0, 2, 5, 7, 9)), ("Кафи", (0, 2, 3, 7))]
+_g = 0.05 / NOTE_UNIT
+MOTIFS_UP = [m for pair in zip(MOTIFS_UP, [(f"рага {n}", tuple((72 + x, _g) for x in fig)) for n, fig in _RAGA_FIG]) for m in pair]
+MOTIFS_DOWN = [m for pair in zip(MOTIFS_DOWN, [(f"рага {n}", tuple((60 + x, _g) for x in reversed(fig))) for n, fig in _RAGA_FIG]) for m in pair]
+_motif = {1200: [len(MOTIFS_UP) - 1], 700: [len(MOTIFS_DOWN) - 1]}
+
+
+def _hz(midi):
+    return 440.0 * 2 ** ((midi - 69) / 12)
+
+
+def _motif_notes(fr, idx):
+    """(частоты, моменты вступления в секундах) мотива idx для сигнала fr."""
+    seq = (MOTIFS_UP if fr == 1200 else MOTIFS_DOWN)[idx][1]
+    hz, on, t = [], [], 0.0
+    for m, ln in seq:
+        hz.append(_hz(m)); on.append(t); t += ln * NOTE_UNIT
+    return tuple(hz), tuple(on)
+
+
+CHORDS = {300: (261.63, 246.94, 220.0),             # C4 B3 A3 — ошибка
+          500: (293.66, 349.23, 293.66),            # D4 F4 D4 — не «Алёна»
+          400: (293.66, 349.23, 293.66)}
+NOTE_STEP = 0.05   # 26.09 «чуть побыстрее» (было 0,07)
+BEEP_VOL = 0.3    # 26.09: 0.12 при системной 19 % не слышно, 0.45 — «ещё мягче»
 BEEP_SR = 48000
 
 
-def _soft_tone(fr, ms):
-    n = int(BEEP_SR * max(ms, 90) / 1000)
-    t = np.arange(n) / BEEP_SR
-    w = np.sin(2 * np.pi * fr * t) + 0.15 * np.sin(4 * np.pi * fr * t)   # чуть второй гармоники — «тёплее», не свист
-    env = np.ones(n)
-    a, r = int(0.015 * BEEP_SR), int(0.06 * BEEP_SR)
-    env[:a] = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, a))                # плавное нарастание 15 мс
-    env[-r:] = 0.5 + 0.5 * np.cos(np.linspace(0, np.pi, r))               # плавное затухание 60 мс
-    return (BEEP_VOL / 1.15 * w * env).astype(np.float32)
+def _ks(f, n, decay, rng, bright=0.5):
+    """Щипковая струна Карплуса–Стронга (векторно по периодам): линия задержки ~sr/f из шума, каждый проход —
+    усреднение соседних отсчётов с потерей decay; bright — доля «сырого» шума в первом периоде (яркость щипка)."""
+    N = max(2, int(round(BEEP_SR / f)))
+    buf = rng.uniform(-1, 1, N)
+    buf = bright * buf + (1 - bright) * np.convolve(buf, np.ones(3) / 3, mode="same")
+    out = np.empty(n)
+    for i in range(0, n, N):
+        m = min(N, n - i)
+        out[i:i + m] = buf[:m]
+        buf = decay * 0.5 * (buf + np.roll(buf, -1))
+    return out
+
+
+_tone_cache = {}
+
+
+def _soft_tone(fr, ms, raga=None):
+    """26.09 «сделай ситар»: аккорд перебором (ноты сверху вниз с шагом 40 мс), каждая — щипковая струна
+    Карплуса–Стронга с жужжанием джавари (мягкое насыщение tanh) и тихие резонансные струны тараб на тех же нотах
+    октавой выше, вступающие через 60 мс с долгим звоном. Длина 0,9 с; звуки просчитываются один раз (кэш)."""
+    idx = (_motif[fr][0] if raga is None else raga) if fr in (1200, 700) else -1
+    key = (fr, idx)   # длительность не используется — звук целиком задаётся нотами
+    if key in _tone_cache:
+        return _tone_cache[key]
+    if idx >= 0:
+        notes, onsets = _motif_notes(fr, idx)
+    else:
+        notes = CHORDS.get(fr, (fr,)); onsets = tuple(NOTE_STEP * k for k in range(len(notes)))
+    n = int(BEEP_SR * (onsets[-1] + 0.75))
+    rng = np.random.default_rng(11)
+    out = np.zeros(n)
+    for k, f in enumerate(notes):                                 # ноты по очереди, прежние ещё звенят
+        d = int(onsets[k] * BEEP_SR)
+        s1 = _ks(f, n - d, 0.995, rng, 0.7) * (0.8 if k < len(notes) - 1 else 1.0)
+        s1 = 0.55 * s1 + 0.45 * np.tanh(3.0 * s1) / np.tanh(3.0)   # джавари: «жужжание» подставки
+        out[d:] += s1
+    dl = int(onsets[-1] * BEEP_SR) + int(0.06 * BEEP_SR)          # тараб на последней ноте — долгий звон
+    out[dl:] += 0.18 * _ks(2 * notes[-1], n - dl, 0.9985, rng, 0.2)
+    fade = int(0.08 * BEEP_SR)
+    out[-fade:] *= np.linspace(1, 0, fade)
+    out = BEEP_VOL * out / max(1e-6, np.abs(out).max()) * 0.8
+    _tone_cache[key] = out.astype(np.float32)
+    return _tone_cache[key]
+
+
+# прогрев: все сигналы просчитываются в фоне при старте, чтобы первый же не опаздывал на ~0,2 с
+def _warm():
+    for f in CHORDS:
+        _soft_tone(f, 0)
+    for i in range(len(MOTIFS_UP)):      # все мотивы (индекс передаётся явно — без гонки с beep)
+        _soft_tone(1200, 0, i)
+    for i in range(len(MOTIFS_DOWN)):
+        _soft_tone(700, 0, i)
+
+
+threading.Thread(target=_warm, daemon=True).start()
+
+
+class Balloon:
+    """26.09 («мотив, который прозвучал, показывать в виде баллона над курсором»): маленькая подсказка над указателем
+    мыши на ~2,5 с. Своё окно Tk в отдельном потоке; окно НЕ активируется (WS_EX_NOACTIVATE, показ SW_SHOWNOACTIVATE),
+    прозрачно для кликов (WS_EX_TRANSPARENT) и без кнопки на панели задач — фокус остаётся в окне, куда печатается текст."""
+
+    def __init__(self):
+        self.q = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def show(self, text):
+        self.q.put(text)
+
+    def _run(self):
+        try:
+            import tkinter as tk
+        except Exception as e:
+            log(f"баллон: нет tkinter: {e!r}")
+            return
+        root = tk.Tk()
+        root.withdraw()
+        u32 = ctypes.windll.user32
+        cur = [None, None]   # (окно, id таймера)
+
+        def pop():
+            try:
+                text = self.q.get_nowait()
+            except queue.Empty:
+                root.after(50, pop)
+                return
+            if cur[0] is not None:
+                cur[0].destroy()
+            w = tk.Toplevel(root)
+            w.withdraw()
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            w.attributes("-alpha", 0.92)
+            tk.Label(w, text=text, font=("Segoe UI", 11), bg="#FFF6D8", fg="#3A2E10", padx=10, pady=5,
+                     relief="solid", bd=1).pack()
+            w.update_idletasks()
+
+            class PT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            pt = PT()
+            u32.GetCursorPos(ctypes.byref(pt))
+            # границы монитора, где указатель (у мониторов левее/выше основного координаты отрицательные — прежний
+            # max(0, …) загонял баллон в левый верхний угол основного экрана)
+            class MI(ctypes.Structure):
+                _fields_ = [("cb", ctypes.c_ulong), ("rc", ctypes.c_long * 4), ("wk", ctypes.c_long * 4), ("fl", ctypes.c_ulong)]
+            mi = MI(); mi.cb = ctypes.sizeof(MI)
+            u32.MonitorFromPoint.restype = ctypes.c_void_p
+            hm = u32.MonitorFromPoint(pt, 2)                     # MONITOR_DEFAULTTONEAREST
+            u32.GetMonitorInfoW(ctypes.c_void_p(hm), ctypes.byref(mi))
+            L, T, R, B = mi.wk[0], mi.wk[1], mi.wk[2], mi.wk[3]
+            bw, bh = w.winfo_reqwidth(), w.winfo_reqheight()
+            x = min(max(L, pt.x - bw // 2), R - bw)
+            y = pt.y - bh - 18                                   # над указателем
+            if y < T:
+                y = pt.y + 24                                    # сверху нет места — под указателем
+            y = min(y, B - bh)
+            # положение задаёт сам Tk (показ мимо Tk — ShowWindow/SetWindowPos — он игнорировал: окно оставалось в 0,0);
+            # стиль «не активироваться» ставится ДО показа, а если фокус всё же ушёл — сразу возвращается
+            w.geometry(f"+{x}+{y}")
+            hwnd = int(w.wm_frame(), 16)                         # внешняя рамка окна Tk
+            ex = u32.GetWindowLongW(hwnd, -20)
+            u32.SetWindowLongW(hwnd, -20, ex | 0x08000000 | 0x80 | 0x20 | 0x8)   # NOACTIVATE|TOOLWINDOW|TRANSPARENT|TOPMOST
+            fg = u32.GetForegroundWindow()
+            w.deiconify()
+            w.update_idletasks()
+            stole = u32.GetForegroundWindow() != fg
+            if stole and fg:
+                u32.SetForegroundWindow(fg)
+            r = (ctypes.c_long * 4)()
+            u32.GetWindowRect(hwnd, ctypes.byref(r))
+            log(f"баллон: мышь {pt.x},{pt.y} → {x},{y}; окно {list(r)}" + ("; фокус уходил — возвращён" if stole else ""))
+
+            def fade(a=0.92):
+                if cur[0] is not w:
+                    return
+                if a <= 0.05:
+                    w.destroy(); cur[0] = None
+                    return
+                w.attributes("-alpha", a)
+                w.after(40, fade, a - 0.08)
+            cur[0] = w
+            w.after(2500, fade)
+            root.after(50, pop)
+
+        root.after(50, pop)
+        root.mainloop()
+
+
+_balloon = [None]
+
+
+def balloon(text):
+    try:
+        if _balloon[0] is None:
+            _balloon[0] = Balloon()
+        _balloon[0].show(text)
+    except Exception as e:
+        log(f"баллон: {e!r}")
 
 
 def beep(*tones):
+    if tones and tones[0][0] in _motif:   # «слушаю»/«отправлено» — следующий мотив своего набора
+        fr = tones[0][0]
+        pool = MOTIFS_UP if fr == 1200 else MOTIFS_DOWN
+        _motif[fr][0] = (_motif[fr][0] + 1) % len(pool)
+        log(f"мотив: {pool[_motif[fr][0]][0]}")
+        balloon(("♪ " if fr == 1200 else "♫ ") + pool[_motif[fr][0]][0])
+
     def run():
         try:
             gap = np.zeros(int(0.03 * BEEP_SR), np.float32)
             parts = []
             for fr, ms in tones:
-                parts += [_soft_tone(SOFT.get(fr, fr), ms), gap]
-            sd.play(np.concatenate(parts), BEEP_SR, blocking=True)
+                parts += [_soft_tone(fr, ms), gap]
+            pcm = (np.clip(np.concatenate(parts), -1, 1) * 32767).astype("<i2").tobytes()
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(BEEP_SR); wf.writeframes(pcm)
+            winsound.PlaySound(buf.getvalue(), winsound.SND_MEMORY | winsound.SND_NODEFAULT)
         except Exception as e:   # нет устройства вывода — прежний писк лучше тишины
             log(f"мягкий сигнал не сыграл: {e!r}")
             for fr, ms in tones:
