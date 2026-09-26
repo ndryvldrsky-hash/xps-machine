@@ -38,6 +38,8 @@ KEY_QUIET_SEC = 0.8              # звук в пределах 0,8 с от на
 SILENCE_END_SEC = 1.0            # пауза, завершающая фразу
 MAX_UTT_SEC = 25.0
 NO_SPEECH_SEC = 5.0              # если после «Алёна» тишина — отмена
+MIC_STALL_SEC = 5.0              # колбэк микрофона молчит дольше — поток мёртв, переоткрыть
+STATUS = os.path.join(HERE, "status.json")   # пульс для витрины «Диктовка» (раз в 30 с)
 
 
 def log(msg):
@@ -529,17 +531,50 @@ class Voice:
         self.wake_enabled = True
         self.busy = False
         self.dbg_t = 0.0
+        self.status_t = 0.0
         self.last_key = 0.0
         self.voiced_n = 0
         self.probes = 0
         self.skipped = 0
         self.win_max = 0.0
-        self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=BLOCK, callback=self._cb)
-        self.stream.start()
+        self.last_cb = time.time()
+        self.reopen_t = 0.0
+        self.reopens = 0
+        self.stream = None
+        self._open_stream()
         threading.Thread(target=self._wake_loop, daemon=True).start()
         threading.Thread(target=self._flag_loop, daemon=True).start()
 
+    # 26.09: в 02:42 (Win32k 267 — экран/сон) микрофон K66 перестал отдавать звук, а поток PortAudio не упал и не
+    # сообщил ошибку: колбэк просто больше не вызывался. «Алёна» висела на wake_q.get(), диктовка по Ctrl получала
+    # ноль кусков и молча выходила (сигнал «слушаю» звучал, текста не было) — 8,5 ч без диктовки. Теперь сторож
+    # в _wake_step: колбэк молчит дольше MIC_STALL_SEC — PortAudio переинициализируется (заново читает список
+    # устройств: после переподключения USB у микрофона новый индекс) и поток открывается на устройстве по умолчанию.
+    def _open_stream(self):
+        if self.stream is not None:
+            try:
+                self.stream.abort()
+                self.stream.close()
+            except Exception as e:
+                log(f"микрофон: старый поток не закрылся: {e!r}")
+            self.stream = None
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception as e:
+                log(f"микрофон: PortAudio не переинициализировался: {e!r}")
+        try:
+            dev = sd.query_devices(kind="input")["name"]
+        except Exception:
+            dev = "?"
+        self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=BLOCK, callback=self._cb)
+        self.stream.start()
+        self.last_cb = time.time()
+        self.mic = dev
+        log(f"микрофон открыт: {dev}")
+
     def _cb(self, indata, frames, t, status):
+        self.last_cb = time.time()
         block = indata.copy()
         if self.rec:
             self.chunks.append(block)
@@ -568,7 +603,11 @@ class Voice:
             return
         self.rec = False
         dur = time.time() - self.t0
-        if self.cancelled or dur < MIN_SEC or not self.chunks:
+        if self.cancelled or dur < MIN_SEC:
+            return
+        if not self.chunks:
+            log(f"клавиша: {dur:.1f} с, но с микрофона не пришло ни одного куска звука")
+            beep((300, 300))
             return
         pcm = np.concatenate(self.chunks).tobytes()
         threading.Thread(target=self._deliver, args=(pcm, dur, False), daemon=True).start()
@@ -587,8 +626,36 @@ class Voice:
                 self.seg = None
                 time.sleep(1)
 
+    def _write_status(self, now):
+        st = {"t": datetime.datetime.now().isoformat(timespec="seconds"), "mic": getattr(self, "mic", "?"),
+              "mic_silent_s": round(now - self.last_cb, 4), "reopens": self.reopens, "wake": self.wake_enabled,
+              "noise": round(self.noise, 4), "busy": self.busy}
+        try:
+            with open(STATUS + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False)
+            os.replace(STATUS + ".tmp", STATUS)
+        except Exception:
+            pass
+
     def _wake_step(self):
-        block = self.wake_q.get()
+        try:
+            block = self.wake_q.get(timeout=1)
+        except queue.Empty:
+            block = None
+        now = time.time()
+        if now - self.status_t > 30:
+            self.status_t = now
+            self._write_status(now)
+        if block is None:
+            if now - self.last_cb > MIC_STALL_SEC and now - self.reopen_t > 10:
+                self.reopen_t = now
+                self.reopens += 1
+                log(f"микрофон молчит {now - self.last_cb:.0f} с — переоткрываю поток (раз {self.reopens})")
+                try:
+                    self._open_stream()
+                except Exception as e:
+                    log(f"микрофон не открылся: {e!r}")
+            return
         rms = float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
         now = time.time()
         self.win_max = max(self.win_max, rms)
