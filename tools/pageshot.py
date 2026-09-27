@@ -10,6 +10,8 @@
 временный профиль удаляется после снимка.
 
   python pageshot.py <url> [--width 1280] [--height 0 (0 — по содержимому)] [--out файл.png] [--wait 25]
+                     [--eval файл.js]  — после загрузки выполнить JS-выражение из файла, результат — в поле "eval"
+                                         (проверка того, чего не видно на снимке: подсказки, атрибуты, shadow DOM)
 Печатает JSON: {"ok", "out", "width", "height", "bytes"}. Вызывается MCP-инструментом xps_pageshot.
 """
 import argparse
@@ -98,11 +100,14 @@ async def shoot(a, profile):
         h = a.height or min(max(await c.js(HEIGHT_JS) or 1200, 600), 16000)
         await c.call("Emulation.setDeviceMetricsOverride", width=a.width, height=h, deviceScaleFactor=1, mobile=False)
         await asyncio.sleep(1.5)
+        ev = None
+        if a.eval:
+            ev = await c.js(open(a.eval, encoding="utf-8-sig").read())
         shot = await c.call("Page.captureScreenshot", format="png", captureBeyondViewport=False)
         data = base64.b64decode(shot["data"])
         with open(a.out, "wb") as f:
             f.write(data)
-        return h, len(data)
+        return h, len(data), ev
 
 
 def main():
@@ -112,6 +117,7 @@ def main():
     p.add_argument("--height", type=int, default=0)
     p.add_argument("--out", default=r"W:\Tools\pageshot\shot.png")
     p.add_argument("--wait", type=int, default=25)
+    p.add_argument("--eval", default="")
     a = p.parse_args()
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     profile = os.path.join(tempfile.gettempdir(), "pageshot_" + uuid.uuid4().hex[:8])
@@ -121,8 +127,11 @@ def main():
                              "--no-first-run", "--hide-scrollbars", "--disable-gpu", "--window-size=1280,1200", "about:blank"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        h, n = asyncio.run(shoot(a, profile))
-        print(json.dumps({"ok": True, "out": a.out, "width": a.width, "height": h, "bytes": n}))
+        h, n, ev = asyncio.run(shoot(a, profile))
+        res = {"ok": True, "out": a.out, "width": a.width, "height": h, "bytes": n}
+        if a.eval:
+            res["eval"] = ev
+        print(json.dumps(res))  # вывод ASCII: консоль WinRM на XPS в cp1252
     except Exception as e:
         print(json.dumps({"ok": False, "error": repr(e)[:300]}))
     finally:
