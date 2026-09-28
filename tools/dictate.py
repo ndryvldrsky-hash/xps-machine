@@ -6,7 +6,10 @@
 2. «Алёна, …» или «Эй, Алёна, …»: детектор речи по громкости режет микрофон на фразы; первые 1,5 с каждой фразы уходят в GigaAM
    на Нуксе. Если там «Алёна» — сигнал, фраза пишется до паузы 1 с (макс. 25 с) и распознаётся целиком,
    обращение срезается, текст печатается в активное окно; если это VS Code (чат Claude Code со мной) — с Enter,
-   и тогда мой ответ целиком проигрывается голосом (правый Ctrl — перебить) (voice_reply.py на Нуксе, Piper, голос Ирины).
+   и тогда мой ответ проигрывается голосом — с 28.09.2026 по частям, включая промежуточные сообщения хода
+   (правый Ctrl — оборвать весь ответ, короткий правый Alt — пропустить часть и перейти к следующей).
+   Диктовка правым Ctrl в чат Code тоже получает ответ голосом — после ручного Enter (без Shift), до 10 мин.
+   (voice_reply.py на Нуксе, Piper, голос Ирины).
    (Vosk small-ru не подошёл: в его словаре нет имени «Алёна».)
 
 Распознавание локальное: Wyoming STT на Нуксе (аддон «Whisper», модель GigaAM v3 e2e через onnx-asr,
@@ -26,6 +29,7 @@ HOST, PORT = "192.168.77.2", 10300
 RATE = 16000
 BLOCK = 480                      # 30 мс
 HOTKEY = "right ctrl"
+SKIP_KEYS = ("right alt", "alt gr")   # короткое нажатие одного правого Alt — следующая часть голосового ответа (28.09)
 MIN_SEC = 0.3
 LOG = os.path.join(HERE, "dictate.log")
 NO_WAKE = os.path.join(HERE, "no_wake")
@@ -460,14 +464,43 @@ REPLY_WAIT_SEC = 1800     # ответ озвучивается целиком �
 REPLY_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reply.wav")
 _reply_gen = [0]           # номер последней отправленной голосом фразы: новая фраза отменяет ожидание старого ответа
 _playing = [False]
+_skip = [False]            # правый Alt: оборвать текущую часть ответа и перейти к следующей
 
 
 def stop_reply():
-    """Оборвать чтение ответа (правый Ctrl — перебить и сразу диктовать)."""
+    """Оборвать чтение ответа (правый Ctrl — перебить и сразу диктовать): и текущую часть, и остальные части хода."""
     if _playing[0]:
         _playing[0] = False
+        _reply_gen[0] += 1             # ожидание следующих частей этого хода тоже прекращается
         winsound.PlaySound(None, 0)
         log("ответ голосом прерван")
+
+
+def skip_part():
+    """Правый Alt: оборвать текущую часть ответа, следующие части хода играют дальше."""
+    if _playing[0]:
+        _skip[0] = True
+        winsound.PlaySound(None, 0)
+        log("часть ответа пропущена — к следующей")
+
+
+CODE_TITLES = ("Visual Studio Code", "Studio Code Server")
+ARM_SEC = 600              # сколько ждать ручного Enter после диктовки по Ctrl в чат Code
+_armed = {"text": "", "t": 0.0}   # первая продиктованная по Ctrl фраза ещё не отправленного сообщения
+
+
+def is_code_window(title):
+    return any(k in title for k in CODE_TITLES)
+
+
+def on_enter():
+    """Ручной Enter в чате Code после диктовки по Ctrl — ждать и озвучить ответ, как после «Алёна, …»."""
+    text, t = _armed["text"], _armed["t"]
+    _armed.update(text="", t=0.0)
+    if not text or time.time() - t > ARM_SEC or not is_code_window(foreground_title()):
+        return
+    log(f"Enter после диктовки — жду ответ голосом на «{text[:60]}»")
+    threading.Thread(target=speak_reply, args=(text, time.time()), daemon=True).start()
 
 
 def norm(t):
@@ -475,13 +508,16 @@ def norm(t):
 
 
 def speak_reply(sent, t_sent):
-    """Ждать озвученный ответ Алёны на отправленную голосом фразу и проиграть его.
+    """Ждать озвученный ответ Алёны на отправленную голосом фразу и проигрывать его по частям.
 
-    Ответ готовит voice_reply.py в аддоне на Нуксе: /local/voice_reply/voice_reply.json + WAV (голос Piper).
-    Сопоставление — по началу отправленного текста в поле `for`."""
+    Ответ готовит voice_reply.py в аддоне на Нуксе: /local/voice_reply/voice_reply.json — лента хода
+    {turn, for, parts: [{id, seq, text, wav, ts, final}]} + WAV каждой части (голос Piper). С 28.09.2026 озвучиваются и
+    промежуточные сообщения хода: части играются по порядку, одна за другой, до части с final. Сопоставление —
+    по началу отправленного текста в поле `for`."""
     key = norm(sent)[:40]
     _reply_gen[0] += 1
     gen = _reply_gen[0]
+    played = set()
     deadline = time.time() + REPLY_WAIT_SEC
     while time.time() < deadline:
         if gen != _reply_gen[0]:
@@ -492,24 +528,42 @@ def speak_reply(sent, t_sent):
                 meta = json.loads(r.read().decode("utf-8"))
         except Exception:
             continue
-        if meta.get("ts", 0) < t_sent - 2 or key not in norm(meta.get("for", "")):
+        if key not in norm(meta.get("for", "")):
             continue
-        try:
-            with urllib.request.urlopen(REPLY_URL + meta["wav"], timeout=10) as r:
-                data = r.read()
-            if gen != _reply_gen[0]:
+        parts = meta.get("parts") or [dict(meta, final=True)]     # старый формат — одна часть
+        for p in parts:
+            if p.get("id") in played or p.get("ts", 0) < t_sent - 2:
+                continue
+            played.add(p.get("id"))
+            try:
+                with urllib.request.urlopen(REPLY_URL + p["wav"], timeout=10) as r:
+                    data = r.read()
+                if gen != _reply_gen[0]:
+                    return
+                with open(REPLY_WAV, "wb") as f:          # SND_ASYNC из памяти нельзя — через файл
+                    f.write(data)
+                log(f"ответ голосом, часть {p.get('seq', 1)}{' (финал)' if p.get('final') else ''} "
+                    f"({len(p.get('text', ''))} симв.): {p.get('text', '')[:120]}")
+                with wave.open(io.BytesIO(data)) as w:
+                    dur = w.getnframes() / w.getframerate()
+                _playing[0] = True
+                winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                end = time.time() + dur
+                _skip[0] = False
+                while time.time() < end:                    # ждём конца части; правый Ctrl обрывает (gen меняется)
+                    if gen != _reply_gen[0]:
+                        return
+                    if _skip[0]:                            # правый Alt — сразу к следующей части
+                        _skip[0] = False
+                        break
+                    time.sleep(0.1)
+                time.sleep(0.5)
+                _playing[0] = False
+            except Exception as e:
+                _playing[0] = False
+                log(f"не удалось проиграть ответ: {e!r}")
+            if p.get("final"):
                 return
-            with open(REPLY_WAV, "wb") as f:          # SND_ASYNC из памяти нельзя — через файл
-                f.write(data)
-            log(f"ответ голосом ({len(meta.get('text', ''))} симв.): {meta.get('text', '')[:120]}")
-            with wave.open(io.BytesIO(data)) as w:
-                dur = w.getnframes() / w.getframerate()
-            _playing[0] = True
-            winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
-            threading.Timer(dur + 0.5, lambda: _playing.__setitem__(0, False)).start()
-        except Exception as e:
-            log(f"не удалось проиграть ответ: {e!r}")
-        return
     log("ответ голосом не дождалась (30 мин)")
 
 
@@ -759,7 +813,8 @@ class Voice:
                     text = text[0].upper() + text[1:]
             title = foreground_title()
             # чат Claude Code: десктопный VS Code или Studio Code Server в браузере
-            send = wake and any(k in title for k in ("Visual Studio Code", "Studio Code Server"))
+            code_win = is_code_window(title)
+            send = wake and code_win
             log(f"{'Алёна' if wake else 'клавиша'}: {dur:.1f} с → {took:.1f} с, окно «{title[:60]}»{' +Enter' if send else ''}: {text}")
             if not text:
                 return
@@ -767,7 +822,12 @@ class Voice:
             if send:
                 time.sleep(0.15)
                 keyboard.send("enter")
+                _armed.update(text="", t=0.0)          # сообщение ушло само — ручного Enter ждать нечего
                 threading.Thread(target=speak_reply, args=(text, time.time()), daemon=True).start()
+            elif code_win and not _armed["text"]:
+                # диктовка правым Ctrl в чат Code: ответ озвучим, когда пользователь сам нажмёт Enter (28.09).
+                # Ключ сопоставления — ПЕРВАЯ фраза сообщения: следующие диктовки до Enter её не перезаписывают.
+                _armed.update(text=text, t=time.time())
         finally:
             self.busy = False
 
@@ -775,9 +835,25 @@ class Voice:
 def main():
     v = Voice()
 
+    alt = {"down": False, "other": False}      # правый Alt считается, только если нажат один, без других клавиш
+
     def on_event(e):
         if e.event_type == "down":
             v.last_key = time.time()
+        if e.name in SKIP_KEYS:
+            if e.event_type == "down":
+                if not alt["down"]:
+                    alt.update(down=True, other=False)
+            else:
+                if alt["down"] and not alt["other"]:
+                    skip_part()
+                alt["down"] = False
+            return
+        if e.event_type == "down" and alt["down"]:
+            alt["other"] = True
+        if e.event_type == "down" and e.name == "enter" and _armed["text"] \
+                and not keyboard.is_pressed("shift") and not v.busy:    # Shift+Enter в чате — перенос строки
+            on_enter()
         if e.name == HOTKEY:
             if e.event_type == "down":
                 stop_reply()
@@ -788,7 +864,7 @@ def main():
             v.cancelled = True
 
     keyboard.hook(on_event)
-    log("запущено: правый Ctrl — диктовка; «Алёна, …» — фраза в активное окно (в VS Code с Enter)")
+    log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа; «Алёна, …» — фраза в активное окно (в VS Code с Enter)")
     keyboard.wait()
 
 
