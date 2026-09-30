@@ -18,7 +18,7 @@
 Выключить режим «Алёна», не трогая диктовку: создать файл no_wake рядом со скриптом (проверяется каждую секунду).
 Запуск: задача планировщика «AlenaDictate» при входе rdpuser (pythonw). Лог — dictate.log рядом.
 """
-import collections, ctypes, io, wave, datetime, json, os, queue, re, socket, threading, time, urllib.request, winsound
+import collections, ctypes, io, wave, datetime, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.request, winsound
 
 import keyboard
 import numpy as np
@@ -43,6 +43,9 @@ SILENCE_END_SEC = 1.0            # пауза, завершающая фразу
 MAX_UTT_SEC = 25.0
 NO_SPEECH_SEC = 5.0              # если после «Алёна» тишина — отмена
 MIC_STALL_SEC = 5.0              # колбэк микрофона молчит дольше — поток мёртв, переоткрыть
+MIC_FAILS_RESTART = 3            # столько неудачных переоткрытий подряд на консоли — перезапуск всего процесса
+MIN_UPTIME_RESTART = 120.0       # не перезапускаться чаще раза в 2 мин (микрофона нет вовсе — не крутиться)
+START_T = time.time()
 STATUS = os.path.join(HERE, "status.json")   # пульс для витрины «Диктовка» (раз в 30 с)
 
 
@@ -507,13 +510,26 @@ def norm(t):
     return re.sub(r"\W+", " ", t).strip().lower()
 
 
+def mark_voice(sent):
+    """Метка «эту фразу отправили голосом» для voice_reply.py (29.09.2026): вебхук HA alena_golos_zapros пишет её в
+    input_text.golos_zapros, и ответ на неё озвучивается Gemini с интонацией; без метки — Piper."""
+    try:
+        req = urllib.request.Request(f"http://{HOST}:8123/api/webhook/alena_golos_zapros", method="POST",
+                                     data=json.dumps({"text": sent[:250]}).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        log(f"метка голоса не отправлена: {e!r}")
+
+
 def speak_reply(sent, t_sent):
     """Ждать озвученный ответ Алёны на отправленную голосом фразу и проигрывать его по частям.
 
     Ответ готовит voice_reply.py в аддоне на Нуксе: /local/voice_reply/voice_reply.json — лента хода
-    {turn, for, parts: [{id, seq, text, wav, ts, final}]} + WAV каждой части (голос Piper). С 28.09.2026 озвучиваются и
+    {turn, for, parts: [{id, seq, text, wav, ts, final}]} + WAV каждой части (голос Gemini, запасной Piper). С 28.09.2026 озвучиваются и
     промежуточные сообщения хода: части играются по порядку, одна за другой, до части с final. Сопоставление —
     по началу отправленного текста в поле `for`."""
+    mark_voice(sent)
     key = norm(sent)[:40]
     _reply_gen[0] += 1
     gen = _reply_gen[0]
@@ -594,6 +610,7 @@ class Voice:
         self.last_cb = time.time()
         self.reopen_t = 0.0
         self.reopens = 0
+        self.mic_fails = 0
         self.stream = None
         self._open_stream()
         threading.Thread(target=self._wake_loop, daemon=True).start()
@@ -626,6 +643,33 @@ class Voice:
         self.last_cb = time.time()
         self.mic = dev
         log(f"микрофон открыт: {dev}")
+
+    # 29.09: в 10:22 сеанс rdpuser ушёл с монитора в RDP (вход с A54), в 10:28 RDP закрыт, в 11:16 сеанс вернулся на
+    # консоль — а процесс до перезапуска в 11:41 так и получал «Error querying device -1»: переинициализация PortAudio
+    # внутри процесса после смены сеанса устройств не видит. Пока сеанс не на консоли (RDP или отключён), местных
+    # микрофонов у него нет — ждём; вернулся на консоль и переоткрыть не удаётся — перезапускаем процесс целиком.
+    @staticmethod
+    def _on_console():
+        sid = ctypes.c_ulong()
+        ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
+        return ctypes.windll.kernel32.WTSGetActiveConsoleSessionId() == sid.value
+
+    def _maybe_restart(self, now):
+        if self.mic_fails < MIC_FAILS_RESTART or now - START_T < MIN_UPTIME_RESTART:
+            return
+        try:
+            if not self._on_console():
+                return
+        except Exception as e:
+            log(f"сеанс: не проверить консоль: {e!r}")
+        log(f"микрофон не открывается {self.mic_fails} раз подряд, сеанс на консоли — перезапускаю процесс")
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=HERE, close_fds=True,
+                             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        except Exception as e:
+            log(f"перезапуск не удался: {e!r}")
+            return
+        os._exit(0)
 
     def _cb(self, indata, frames, t, status):
         self.last_cb = time.time()
@@ -707,8 +751,11 @@ class Voice:
                 log(f"микрофон молчит {now - self.last_cb:.0f} с — переоткрываю поток (раз {self.reopens})")
                 try:
                     self._open_stream()
+                    self.mic_fails = 0
                 except Exception as e:
+                    self.mic_fails += 1
                     log(f"микрофон не открылся: {e!r}")
+                    self._maybe_restart(now)
             return
         rms = float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
         now = time.time()
@@ -832,14 +879,57 @@ class Voice:
             self.busy = False
 
 
+def voice_hotkey(action):
+    """Горячая клавиша голоса Алёны (30.09.2026, по образцу правых Ctrl/Alt): короткое нажатие одного правого Shift —
+    следующий голос Gemini по списку, двойное (два нажатия за 0,4 с) — режим «Случайный» (новый голос на каждый ответ). Вебхук HA alena_golos_hotkey → input_select.golos_alyony →
+    голос.json, который voice_reply.py читает на каждую часть; перезапусков не нужно."""
+    def run():
+        try:
+            req = urllib.request.Request(f"http://{HOST}:8123/api/webhook/alena_golos_hotkey", method="POST",
+                                         data=json.dumps({"action": action}).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5).read()
+            beep((900, 50), (1100, 50)) if action == "next" else beep((1100, 40), (800, 40), (1100, 40))
+            balloon("🎙 голос: " + ("следующий" if action == "next" else "случайный"))
+            log(f"горячая клавиша голоса: {action}")
+        except Exception as e:
+            log(f"горячая клавиша голоса не сработала: {e!r}")
+            beep((300, 200))
+    threading.Thread(target=run, daemon=True).start()
+
+
 def main():
     v = Voice()
 
     alt = {"down": False, "other": False}      # правый Alt считается, только если нажат один, без других клавиш
+    rsh = {"down": False, "other": False, "last": 0.0, "timer": None}   # правый Shift — так же, только в одиночку
+
+    def rshift_fire():
+        rsh["timer"] = None
+        voice_hotkey("next")
 
     def on_event(e):
         if e.event_type == "down":
             v.last_key = time.time()
+        if e.name == "right shift":
+            if e.event_type == "down":
+                if not rsh["down"]:
+                    rsh.update(down=True, other=False)
+            else:
+                if rsh["down"] and not rsh["other"]:
+                    t = time.time()
+                    if rsh["timer"] and t - rsh["last"] < 0.4:        # второе нажатие — случайный голос
+                        rsh["timer"].cancel()
+                        rsh["timer"] = None
+                        voice_hotkey("random")
+                    else:                                             # ждём, не будет ли второго нажатия
+                        rsh["timer"] = threading.Timer(0.4, rshift_fire)
+                        rsh["timer"].start()
+                    rsh["last"] = t
+                rsh["down"] = False
+            return
+        if e.event_type == "down" and rsh["down"]:
+            rsh["other"] = True                                      # Shift+буква — обычный ввод, не команда
         if e.name in SKIP_KEYS:
             if e.event_type == "down":
                 if not alt["down"]:
@@ -864,7 +954,7 @@ def main():
             v.cancelled = True
 
     keyboard.hook(on_event)
-    log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа; «Алёна, …» — фраза в активное окно (в VS Code с Enter)")
+    log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
     keyboard.wait()
 
 
