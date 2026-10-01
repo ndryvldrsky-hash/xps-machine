@@ -28,6 +28,28 @@ LOGF = os.path.join(DIR, "trainer_log.jsonl")
 RATE = 16000
 MODEL = "gemini-2.5-flash"
 
+
+def rtl(s):
+    """30.09: Tk на Windows считает строку левосторонней и переставляет куски иврита вокруг латиницы («IP», «TMS») —
+    обёртка RLE…PDF задаёт направление справа налево (проверено на XPS: единственный вариант с правильным порядком)."""
+    return "\u202b" + s + "\u202c" if s else s
+
+
+def rtl_runs(s):
+    """В русской строке каждое ивритское словосочетание — в RLE…PDF, иначе Tk выводит его слова в обратном порядке."""
+    import re
+    return re.sub(r"[\u0590-\u05ff][\u0590-\u05ff\s\-־'\".,]*[\u0590-\u05ff]|[\u0590-\u05ff]",
+                  lambda m: rtl(m.group(0)), s)
+
+
+def analysis_text(a):
+    """30.09: лингвистический разбор фразы (поле analysis в phrases.json, готовит тренажёр_разбор.py в аддоне)."""
+    if not a:
+        return ""
+    out = [f"• {w['he']} [{w['tr']}] — {w['ru']}. {w['gram']}" for w in a.get("words", [])]
+    out += [""] + [f"💡 {n}" for n in a.get("notes", [])] if a.get("notes") else []
+    return "\n".join(rtl_runs(x) for x in out)
+
 PROMPT = """Кандидат (русскоязычный, учит иврит) читает вслух фразу для собеседования. Целевая фраза:
 {he}  ({ru})
 Сначала внимательно прослушай запись и запиши, что реально прозвучало, потом сравни с целевой фразой по словам.
@@ -77,7 +99,10 @@ class Trainer:
         self.state = tk.Label(r, font=("Segoe UI", 16, "bold"), fg="#e0c060", bg="#111418")
         self.state.pack(pady=10)
         self.fb = tk.Label(r, font=("Segoe UI", 15), fg="#eafbe9", bg="#111418", wraplength=1150, justify="left")
-        self.fb.pack(pady=8, padx=30, anchor="w")
+        self.fb.pack(pady=(0, 4), padx=30, anchor="w")
+        # 30.09 (просьба пользователя): разбор фразы — простым текстом прямо под жёлтой надписью
+        self.an = tk.Label(r, font=("Segoe UI", 13), fg="#c9d1d9", bg="#111418", wraplength=1200, justify="left")
+        self.an.pack(pady=(4, 6), padx=30, anchor="w")
         tk.Label(r, text="Enter или P — послушать (быстро/медленно) · Пробел — запись/стоп · R — ещё раз · → следующая · ← предыдущая · Esc — выход",
                  font=("Segoe UI", 11), fg="#777777", bg="#111418").pack(side="bottom", pady=10)
         r.bind("<space>", lambda e: self.toggle())
@@ -92,10 +117,11 @@ class Trainer:
 
     def show(self):
         p = self.phrases[self.i]
-        self.he.config(text=p["he"])
+        self.he.config(text=rtl(p["he"]))
         self.ru.config(text=f"{self.i + 1}/{len(self.phrases)} · {p['ru']}")
         self.state.config(text="Пробел — начать запись", fg="#e0c060")
         self.fb.config(text="")
+        self.an.config(text=analysis_text(p.get("analysis")))
         self.fast = True                # 30.09: на новой фразе первым — быстрый (естественный) вариант
         self.btn.config(text="▶  Послушать быстро (Enter)")
         # 30.09 (просьба пользователя): образцы готовы заранее — текущую и следующую фразу (оба темпа) озвучиваем в фоне

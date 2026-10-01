@@ -29,6 +29,12 @@ TOKEN = os.path.join(DIR, "token.json")
 TALK = os.path.join(DIR, "talk.jsonl")
 SUGGEST = os.path.join(DIR, "suggest.json")
 LOG = os.path.join(DIR, "perevod.log")
+
+
+def rtl(s):
+    """30.09: Tk на Windows считает строку левосторонней и переставляет куски иврита вокруг латиницы («IP», «TMS») —
+    обёртка RLE…PDF задаёт направление справа налево (проверено на XPS: единственный вариант с правильным порядком)."""
+    return "\u202b" + s + "\u202c" if s else s
 RATE = 16000
 BLOCK = RATE // 20            # 50 мс
 SILENCE_END = 0.7             # пауза, после которой фраза считается законченной, с
@@ -367,7 +373,7 @@ class Window:
             t.insert("end", self.status + "\n", "status")
         for he, ru in self.lines:
             t.insert("end", ru + "\n", "ru")
-            t.insert("end", he + "\n", "he")
+            t.insert("end", rtl(he) + "\n", "he")
         if self.hearing:
             t.insert("end", "🎙 …\n", "status")
         t.configure(state="disabled")
@@ -380,7 +386,7 @@ class Window:
         else:
             g.insert("end", "✅ ОТВЕТ АЛЁНЫ\n", "title")
         for n, a in enumerate(self.answers, 1):
-            g.insert("end", a.get("he", "") + "\n", "he")
+            g.insert("end", rtl(a.get("he", "")) + "\n", "he")
             g.insert("end", f"{n}) {a.get('ru', '')}\n\n", "ru")
         if not self.answers:
             g.insert("end", "подсказка появится после фразы собеседника\n", "ru")
