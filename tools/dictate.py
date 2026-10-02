@@ -12,8 +12,9 @@
    (voice_reply.py на Нуксе, Piper, голос Ирины).
    (Vosk small-ru не подошёл: в его словаре нет имени «Алёна».)
 
-Распознавание локальное: Wyoming STT на Нуксе (аддон «Whisper», модель GigaAM v3 e2e через onnx-asr,
-192.168.77.2:10300). Звук в интернет не уходит.
+Распознавание локальное, модель GigaAM v3 e2e через onnx-asr (Wyoming, порт 10300): сначала Кузница
+(192.168.77.62, видеокарта RTX 2000 Ada — служба stt-gigaam, с 02.10.2026), а если она выключена или не
+отвечает — Нукс (192.168.77.2, аддон «Whisper», процессор). Звук в интернет не уходит.
 Сигналы: 1200 Гц — слушаю, 700 — отправлено, 300 — ошибка, 500+400 — «Алёна» не подтвердилась.
 Выключить режим «Алёна», не трогая диктовку: создать файл no_wake рядом со скриптом (проверяется каждую секунду).
 Запуск: задача планировщика «AlenaDictate» при входе rdpuser (pythonw). Лог — dictate.log рядом.
@@ -26,6 +27,9 @@ import sounddevice as sd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST, PORT = "192.168.77.2", 10300
+STT_HOSTS = ("192.168.77.62", HOST)   # Кузница (видеокарта), запасной — Нукс
+STT_CONNECT_SEC = 0.7                 # выключенная Кузница не должна задерживать диктовку
+_stt_skip = {}                        # адрес → время, до которого его не пробовать (после неудачи)
 RATE = 16000
 BLOCK = 480                      # 30 мс
 HOTKEY = "right ctrl"
@@ -433,10 +437,10 @@ def wy_send(s, typ, data=None, payload=b""):
     s.sendall((json.dumps(h) + "\n").encode() + payload)
 
 
-def transcribe(pcm: bytes) -> str:
-    """16 кГц моно int16 → Wyoming STT на Нуксе → текст."""
+def _transcribe_on(host: str, pcm: bytes, connect_sec: float) -> str:
     fmt = {"rate": RATE, "width": 2, "channels": 1}
-    with socket.create_connection((HOST, PORT), timeout=30) as s:
+    with socket.create_connection((host, PORT), timeout=connect_sec) as s:
+        s.settimeout(30)
         f = s.makefile("rb")
         wy_send(s, "transcribe", {"language": "ru"})
         wy_send(s, "audio-start", fmt)
@@ -452,6 +456,24 @@ def transcribe(pcm: bytes) -> str:
                 f.read(h["payload_length"])
             if h["type"] == "transcript":
                 return (d.get("text") or "").strip()
+
+
+def transcribe(pcm: bytes) -> str:
+    """16 кГц моно int16 → Wyoming STT (Кузница, запасной Нукс) → текст."""
+    last = STT_HOSTS[-1]
+    for host in STT_HOSTS:
+        if host != last and time.time() < _stt_skip.get(host, 0):
+            continue
+        try:
+            return _transcribe_on(host, pcm, 30 if host == last else STT_CONNECT_SEC)
+        except Exception as e:
+            if host == last:
+                raise
+            _stt_skip[host] = time.time() + 120     # две минуты не пробовать, потом снова
+            try:
+                log(f"распознавание: {host} не отвечает ({e!r}) — запасной {last}")
+            except Exception:
+                pass
 
 
 def foreground_title() -> str:

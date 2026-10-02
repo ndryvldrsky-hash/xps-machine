@@ -231,6 +231,20 @@ def fix_nikud(full, nik):
     return "".join(out)
 
 
+LOCAL_URL = "http://192.168.77.62:10310/phrase"   # Кузница: ivrit-ai Whisper + gemma3 на видеокарте (служба perevod-he)
+USE_GEMINI = os.path.join(DIR, "use_gemini")      # файл-флажок рядом с программой: переводить через Gemini, а не локально
+
+
+def local_translate(pcm):
+    """Фраза → Кузница → {"he", "ru"}; звук в интернет не уходит. Черновиков ответа локальный путь не даёт — подсказки шлёт Алёна."""
+    hist = base64.b64encode(json.dumps(history[-6:], ensure_ascii=False).encode()).decode()
+    r = requests.post(LOCAL_URL, data=wav_bytes(pcm), headers={"X-History": hist}, timeout=(0.7, 25))
+    r.raise_for_status()
+    d = r.json()
+    log(f"Кузница: распознавание {d.get('stt_ms')} мс, перевод {d.get('tr_ms')} мс")
+    return d
+
+
 def translate_loop():
     while not stop.is_set():
         try:
@@ -239,18 +253,25 @@ def translate_loop():
             continue
         t0 = time.time()
         try:
-            tok, proj = creds()
-            body = {"contents": [{"role": "user", "parts": [
-                        {"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(wav_bytes(pcm)).decode()}},
-                        {"text": PROMPT.replace("{profile}", open(PROFILE, encoding="utf-8").read() if os.path.exists(PROFILE) else "")
-                                        .replace("{history}", "\n".join(f"- {h} ({r})" for h, r in history[-6:]) or "—")}]}],
-                    "generationConfig": {"responseMimeType": "application/json", "temperature": 0,
-                                         "thinkingConfig": {"thinkingBudget": 0}}}
-            r = requests.post(f"https://aiplatform.googleapis.com/v1/projects/{proj}/locations/global/publishers/google/"
-                              f"models/{MODEL}:generateContent", headers={"Authorization": f"Bearer {tok}"},
-                              json=body, timeout=30)
-            r.raise_for_status()
-            d = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            d = None
+            if not os.path.exists(USE_GEMINI):
+                try:
+                    d = local_translate(pcm)
+                except Exception as e:
+                    log("локальный перевод не вышел:", repr(e)[:200], "— перехожу на Gemini")
+            if d is None:
+                tok, proj = creds()
+                body = {"contents": [{"role": "user", "parts": [
+                            {"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(wav_bytes(pcm)).decode()}},
+                            {"text": PROMPT.replace("{profile}", open(PROFILE, encoding="utf-8").read() if os.path.exists(PROFILE) else "")
+                                            .replace("{history}", "\n".join(f"- {h} ({r})" for h, r in history[-6:]) or "—")}]}],
+                        "generationConfig": {"responseMimeType": "application/json", "temperature": 0,
+                                             "thinkingConfig": {"thinkingBudget": 0}}}
+                r = requests.post(f"https://aiplatform.googleapis.com/v1/projects/{proj}/locations/global/publishers/google/"
+                                  f"models/{MODEL}:generateContent", headers={"Authorization": f"Bearer {tok}"},
+                                  json=body, timeout=30)
+                r.raise_for_status()
+                d = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
             he, ru = (d.get("he") or "").strip(), (d.get("ru") or "").strip()
             if not he:
                 continue
