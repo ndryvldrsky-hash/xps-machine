@@ -20,6 +20,7 @@
 Запуск: задача планировщика «AlenaDictate» при входе rdpuser (pythonw). Лог — dictate.log рядом.
 """
 import collections, ctypes, io, wave, datetime, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.request, winsound
+from ctypes import wintypes
 
 import keyboard
 import numpy as np
@@ -476,6 +477,93 @@ def transcribe(pcm: bytes) -> str:
                 pass
 
 
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+# ВАЖНО: типы объявлять обязательно. Без argtypes/restype ctypes считает, что функция возвращает int (32 бита),
+# и 64-битный дескриптор буфера обмена молча обрезается — обращение по битому адресу убивает процесс целиком,
+# без исключения и без строки в логе. Так 02.10 диктовка и легла после первой же вставки.
+_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_u32.OpenClipboard.argtypes, _u32.OpenClipboard.restype = [wintypes.HWND], wintypes.BOOL
+_u32.CloseClipboard.argtypes, _u32.CloseClipboard.restype = [], wintypes.BOOL
+_u32.EmptyClipboard.argtypes, _u32.EmptyClipboard.restype = [], wintypes.BOOL
+_u32.GetClipboardData.argtypes, _u32.GetClipboardData.restype = [wintypes.UINT], wintypes.HANDLE
+_u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+_u32.SetClipboardData.restype = wintypes.HANDLE
+_k32.GlobalAlloc.argtypes, _k32.GlobalAlloc.restype = [wintypes.UINT, ctypes.c_size_t], wintypes.HGLOBAL
+_k32.GlobalLock.argtypes, _k32.GlobalLock.restype = [wintypes.HGLOBAL], wintypes.LPVOID
+_k32.GlobalUnlock.argtypes, _k32.GlobalUnlock.restype = [wintypes.HGLOBAL], wintypes.BOOL
+
+
+def _буфер_открыть(попыток=10):
+    """Буфер обмена — общий на всю систему, его может держать другое окно; ждём своей очереди."""
+    for _ in range(попыток):
+        if _u32.OpenClipboard(None):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def буфер_прочитать():
+    """Текст из буфера обмена (или None, если там не текст либо буфер занят)."""
+    if not _буфер_открыть():
+        return None
+    try:
+        h = _u32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return None
+        p = _k32.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            return ctypes.wstring_at(p)
+        finally:
+            _k32.GlobalUnlock(h)
+    finally:
+        _u32.CloseClipboard()
+
+
+def буфер_записать(text):
+    if not _буфер_открыть():
+        return False
+    try:
+        _u32.EmptyClipboard()
+        данные = ctypes.create_unicode_buffer(text)
+        размер = ctypes.sizeof(данные)
+        h = _k32.GlobalAlloc(GMEM_MOVEABLE, размер)
+        if not h:
+            return False
+        p = _k32.GlobalLock(h)
+        if not p:
+            return False
+        ctypes.memmove(p, ctypes.byref(данные), размер)
+        _k32.GlobalUnlock(h)
+        # SetClipboardData забирает память себе — освобождать её нельзя
+        return bool(_u32.SetClipboardData(CF_UNICODETEXT, h))
+    finally:
+        _u32.CloseClipboard()
+
+
+def вставить(text):
+    """Положить текст в окно ОДНИМ движением — через буфер обмена и Ctrl+V (02.10, просьба пользователя).
+
+    Посимвольный ввод (keyboard.write) иногда терял ПРОБЕЛЫ — «Ачторежимночи…»: распознавалось верно,
+    но на Windows каждый символ уходит отдельным SendInput KEYEVENTF_UNICODE, и Chromium (окно VS Code)
+    на быстрой очереди часть событий не разбирал. Вставка кладёт всю фразу разом, терять нечего.
+    Прежнее содержимое буфера возвращаем: пользователь мог что-то скопировать для себя.
+    """
+    прежнее = буфер_прочитать()
+    if not буфер_записать(text):
+        log("буфер обмена занят — ввожу посимвольно")
+        keyboard.write(text, delay=0.005)
+        return
+    keyboard.send("ctrl+v")
+    time.sleep(0.25)                       # дать окну забрать текст до возврата буфера
+    if прежнее is not None and прежнее != text:
+        буфер_записать(прежнее)
+
+
 def foreground_title() -> str:
     u = ctypes.windll.user32
     hwnd = u.GetForegroundWindow()
@@ -887,7 +975,7 @@ class Voice:
             log(f"{'Алёна' if wake else 'клавиша'}: {dur:.1f} с → {took:.1f} с, окно «{title[:60]}»{' +Enter' if send else ''}: {text}")
             if not text:
                 return
-            keyboard.write(text if send else text + " ")
+            вставить(text if send else text + " ")
             if send:
                 time.sleep(0.15)
                 keyboard.send("enter")
