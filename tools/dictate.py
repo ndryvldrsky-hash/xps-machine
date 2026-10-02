@@ -300,9 +300,30 @@ def _warm():
 threading.Thread(target=_warm, daemon=True).start()
 
 
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class GUITHREADINFO(ctypes.Structure):
+    """GetGUIThreadInfo у потока активного окна: даёт каретку (rcCaret, координаты клиентские) и окно
+    с фокусом — по ним баллон встаёт над полем ввода. У Chromium/Electron/UWP классической каретки нет,
+    hwndCaret там 0 — тогда якорем служит окно с фокусом."""
+    _fields_ = [("cbSize", ctypes.c_ulong), ("flags", ctypes.c_ulong),
+                ("hwndActive", ctypes.c_void_p), ("hwndFocus", ctypes.c_void_p),
+                ("hwndCapture", ctypes.c_void_p), ("hwndMenuOwner", ctypes.c_void_p),
+                ("hwndMoveSize", ctypes.c_void_p), ("hwndCaret", ctypes.c_void_p),
+                ("rcCaret", RECT)]
+
+
 class Balloon:
-    """26.09 («мотив, который прозвучал, показывать в виде баллона над курсором»): маленькая подсказка над указателем
-    мыши на ~2,5 с. Своё окно Tk в отдельном потоке; окно НЕ активируется (WS_EX_NOACTIVATE, показ SW_SHOWNOACTIVATE),
+    """26.09 («мотив, который прозвучал, показывать в виде баллона над курсором»): маленькая подсказка на ~2,5 с.
+    02.10 по просьбе пользователя переехала с указателя мыши на ПОЛЕ ВВОДА — встаёт над кареткой/полем, куда ляжет
+    текст. Своё окно Tk в отдельном потоке; окно НЕ активируется (WS_EX_NOACTIVATE, показ SW_SHOWNOACTIVATE),
     прозрачно для кликов (WS_EX_TRANSPARENT) и без кнопки на панели задач — фокус остаётся в окне, куда печатается текст."""
 
     def __init__(self):
@@ -340,25 +361,60 @@ class Balloon:
                      relief="solid", bd=1).pack()
             w.update_idletasks()
 
-            class PT(ctypes.Structure):
-                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-            pt = PT()
-            u32.GetCursorPos(ctypes.byref(pt))
-            # границы монитора, где указатель (у мониторов левее/выше основного координаты отрицательные — прежний
-            # max(0, …) загонял баллон в левый верхний угол основного экрана)
+            # 02.10 (просьба пользователя): баллон больше не ходит за указателем мыши — он встаёт НАД ПОЛЕМ,
+            # куда ляжет текст. Якорь ищем по убыванию точности: каретка активного потока → окно с фокусом
+            # (поле ввода) → само активное окно → верх-центр основного экрана.
             class MI(ctypes.Structure):
                 _fields_ = [("cb", ctypes.c_ulong), ("rc", ctypes.c_long * 4), ("wk", ctypes.c_long * 4), ("fl", ctypes.c_ulong)]
             mi = MI(); mi.cb = ctypes.sizeof(MI)
+            # типы объявлять обязательно: без restype ctypes режет 64-битные дескрипторы до 32 бит
+            u32.GetForegroundWindow.restype = ctypes.c_void_p
+            u32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+            u32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            u32.MonitorFromWindow.restype = ctypes.c_void_p
             u32.MonitorFromPoint.restype = ctypes.c_void_p
-            hm = u32.MonitorFromPoint(pt, 2)                     # MONITOR_DEFAULTTONEAREST
+            u32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            u32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+            fgw = u32.GetForegroundWindow()
+            anchor, how = None, "экран"
+            if fgw:
+                tid = u32.GetWindowThreadProcessId(fgw, None)
+                gti = GUITHREADINFO(); gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+                if u32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
+                    # каретка: координаты клиентские, у hwndCaret (а если его нет — у окна с фокусом)
+                    cw = gti.hwndCaret or gti.hwndFocus
+                    c = gti.rcCaret
+                    if cw and (c.right - c.left) >= 0 and (c.bottom - c.top) > 0:
+                        p1, p2 = POINT(c.left, c.top), POINT(c.right, c.bottom)
+                        if u32.ClientToScreen(cw, ctypes.byref(p1)) and u32.ClientToScreen(cw, ctypes.byref(p2)):
+                            anchor, how = (p1.x, p1.y, p2.x, p2.y), "каретка"
+                    if anchor is None and gti.hwndFocus:
+                        r0 = (ctypes.c_long * 4)()
+                        if u32.GetWindowRect(gti.hwndFocus, ctypes.byref(r0)):
+                            anchor, how = tuple(r0), "поле"
+                if anchor is None:
+                    r0 = (ctypes.c_long * 4)()
+                    if u32.GetWindowRect(fgw, ctypes.byref(r0)):
+                        anchor, how = tuple(r0), "окно"
+
+            hm = u32.MonitorFromWindow(fgw, 2) if fgw else None   # MONITOR_DEFAULTTONEAREST
+            if not hm:
+                hm = u32.MonitorFromPoint(POINT(0, 0), 1)         # MONITOR_DEFAULTTOPRIMARY
             u32.GetMonitorInfoW(ctypes.c_void_p(hm), ctypes.byref(mi))
             L, T, R, B = mi.wk[0], mi.wk[1], mi.wk[2], mi.wk[3]
             bw, bh = w.winfo_reqwidth(), w.winfo_reqheight()
-            x = min(max(L, pt.x - bw // 2), R - bw)
-            y = pt.y - bh - 18                                   # над указателем
-            if y < T:
-                y = pt.y + 24                                    # сверху нет места — под указателем
-            y = min(y, B - bh)
+            if anchor is None:
+                x, y = L + (R - L - bw) // 2, T + 24
+            else:
+                ax1, ay1, ax2, ay2 = anchor
+                x = (ax1 + ax2 - bw) // 2
+                y = ay1 - bh - 8                                  # над полем
+                if y < T:
+                    y = ay2 + 8                                   # сверху нет места — под полем
+            x = min(max(L, x), max(L, R - bw))
+            y = min(max(T, y), max(T, B - bh))
             # положение задаёт сам Tk (показ мимо Tk — ShowWindow/SetWindowPos — он игнорировал: окно оставалось в 0,0);
             # стиль «не активироваться» ставится ДО показа, а если фокус всё же ушёл — сразу возвращается
             w.geometry(f"+{x}+{y}")
@@ -373,7 +429,7 @@ class Balloon:
                 u32.SetForegroundWindow(fg)
             r = (ctypes.c_long * 4)()
             u32.GetWindowRect(hwnd, ctypes.byref(r))
-            log(f"баллон: мышь {pt.x},{pt.y} → {x},{y}; окно {list(r)}" + ("; фокус уходил — возвращён" if stole else ""))
+            log(f"баллон: якорь {how} {anchor} → {x},{y}; окно {list(r)}" + ("; фокус уходил — возвращён" if stole else ""))
 
             def fade(a=0.92):
                 if cur[0] is not w:
