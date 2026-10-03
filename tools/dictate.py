@@ -7,7 +7,9 @@
    на Нуксе. Если там «Алёна» — сигнал, фраза пишется до паузы 1 с (макс. 25 с) и распознаётся целиком,
    обращение срезается, текст печатается в активное окно; если это VS Code (чат Claude Code со мной) — с Enter,
    и тогда мой ответ проигрывается голосом — с 28.09.2026 по частям, включая промежуточные сообщения хода
-   (правый Ctrl — оборвать весь ответ, короткий правый Alt — пропустить часть и перейти к следующей).
+   (правый Ctrl — оборвать весь ответ, короткий правый Alt — пропустить часть и перейти к следующей,
+   двойной правый Alt — вернуться к предыдущей, в тишине — повторить последнюю; история — 30 частей
+   через все ответы, новая часть не перебивает ту, что слушают, а ждёт своей очереди).
    Диктовка правым Ctrl в чат Code тоже получает ответ голосом — после ручного Enter (без Shift), до 10 мин.
    (voice_reply.py на Нуксе, Piper, голос Ирины).
    (Vosk small-ru не подошёл: в его словаре нет имени «Алёна».)
@@ -634,6 +636,10 @@ REPLY_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reply.wav"
 _reply_gen = [0]           # номер последней отправленной голосом фразы: новая фраза отменяет ожидание старого ответа
 _playing = [False]
 _skip = [False]            # правый Alt: оборвать текущую часть ответа и перейти к следующей
+_back = [False]            # двойной правый Alt: вернуться к предыдущей части (03.10)
+_hist = []                 # последние сыгранные части через ВСЕ ответы подряд: (подпись, WAV-байты) — по ним ходит «назад»
+HIST_MAX = 30              # сколько частей помнить (WAV лежат в памяти: ~1,5 МБ на полминуты речи)
+_live_gen = [0]            # номер хода, чей цикл проигрывания сейчас жив (0 — никто не играет и не ждёт частей)
 
 
 def stop_reply():
@@ -651,6 +657,69 @@ def skip_part():
         _skip[0] = True
         winsound.PlaySound(None, 0)
         log("часть ответа пропущена — к следующей")
+
+
+def prev_part():
+    """Двойной правый Alt: оборвать текущую часть и сыграть предыдущую; в тишине — повторить последнюю сыгранную."""
+    if _live_gen[0]:                   # цикл ответа жив (играет или ждёт следующую часть) — он сам шагнёт назад
+        _back[0] = True
+        if _playing[0]:
+            winsound.PlaySound(None, 0)
+        log("назад — к предыдущей части ответа")
+    elif _hist:                        # ответ уже дочитан или оборван — повторить его последнюю часть
+        log("назад — повтор последней части ответа")
+        threading.Thread(target=replay_tail, daemon=True).start()
+
+
+def _play_part(item, gen):
+    """Сыграть одну часть ответа. Возвращает 'done' (дочитана), 'skip' (правый Alt), 'back' (двойной правый Alt)
+    или 'stop' (ответ оборван правым Ctrl либо начат новый)."""
+    label, data = item
+    with open(REPLY_WAV, "wb") as f:          # SND_ASYNC из памяти нельзя — через файл
+        f.write(data)
+    with wave.open(io.BytesIO(data)) as w:
+        dur = w.getnframes() / w.getframerate()
+    _playing[0] = True
+    _skip[0] = _back[0] = False
+    winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    end = time.time() + dur
+    res = "done"
+    while time.time() < end:                    # ждём конца части; правый Ctrl обрывает (gen меняется)
+        if gen != _reply_gen[0]:
+            return "stop"
+        if _back[0]:
+            _back[0] = False
+            res = "back"
+            break
+        if _skip[0]:
+            _skip[0] = False
+            res = "skip"
+            break
+        time.sleep(0.1)
+    if res == "done":
+        time.sleep(0.5)
+    _playing[0] = False
+    return res
+
+
+def replay_tail():
+    """Повтор с последней сыгранной части, когда ничего не играет; Alt и двойной Alt ходят по истории так же."""
+    _reply_gen[0] += 1
+    gen = _reply_gen[0]
+    _live_gen[0] = gen
+    try:
+        pos = len(_hist) - 1
+        while 0 <= pos < len(_hist):
+            res = _play_part(_hist[pos], gen)
+            if res == "stop":
+                return
+            pos = max(0, pos - 1) if res == "back" else pos + 1
+    except Exception as e:
+        _playing[0] = False
+        log(f"не удалось повторить часть ответа: {e!r}")
+    finally:
+        if _live_gen[0] == gen:
+            _live_gen[0] = 0
 
 
 CODE_TITLES = ("Visual Studio Code", "Studio Code Server")
@@ -699,53 +768,70 @@ def speak_reply(sent, t_sent):
     key = norm(sent)[:40]
     _reply_gen[0] += 1
     gen = _reply_gen[0]
-    played = set()
+    _live_gen[0] = gen
+    seen = set()
+    # какая часть из _hist играет следующей; pos == len(_hist) — ждём новую. История общая для всех ответов (03.10):
+    # «назад» уходит и в прошлые ответы, а новые части текущего не перебивают — ждут в очереди, пока до них дойдёт очередь.
+    pos = len(_hist)
+    final = False
     deadline = time.time() + REPLY_WAIT_SEC
-    while time.time() < deadline:
-        if gen != _reply_gen[0]:
-            return
-        time.sleep(1.5)
-        try:
-            with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
-                meta = json.loads(r.read().decode("utf-8"))
-        except Exception:
-            continue
-        if key not in norm(meta.get("for", "")):
-            continue
-        parts = meta.get("parts") or [dict(meta, final=True)]     # старый формат — одна часть
-        for p in parts:
-            if p.get("id") in played or p.get("ts", 0) < t_sent - 2:
-                continue
-            played.add(p.get("id"))
-            try:
-                with urllib.request.urlopen(REPLY_URL + p["wav"], timeout=10) as r:
-                    data = r.read()
-                if gen != _reply_gen[0]:
+    try:
+        while time.time() < deadline:
+            if gen != _reply_gen[0]:
+                return
+            if pos < len(_hist):
+                try:
+                    res = _play_part(_hist[pos], gen)
+                except Exception as e:
+                    _playing[0] = False
+                    log(f"не удалось проиграть ответ: {e!r}")
+                    res = "done"
+                if res == "stop":
                     return
-                with open(REPLY_WAV, "wb") as f:          # SND_ASYNC из памяти нельзя — через файл
-                    f.write(data)
-                log(f"ответ голосом, часть {p.get('seq', 1)}{' (финал)' if p.get('final') else ''} "
-                    f"({len(p.get('text', ''))} симв.): {p.get('text', '')[:120]}")
-                with wave.open(io.BytesIO(data)) as w:
-                    dur = w.getnframes() / w.getframerate()
-                _playing[0] = True
-                winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                end = time.time() + dur
-                _skip[0] = False
-                while time.time() < end:                    # ждём конца части; правый Ctrl обрывает (gen меняется)
+                pos = max(0, pos - 1) if res == "back" else pos + 1
+                continue
+            if final:
+                return
+            for _ in range(15):                             # ждём следующую часть; двойной Alt в тишине — повтор последней
+                if _back[0] or gen != _reply_gen[0]:
+                    break
+                time.sleep(0.1)
+            if _back[0]:
+                _back[0] = False
+                if _hist:
+                    pos = len(_hist) - 1
+                continue
+            try:
+                with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
+                    meta = json.loads(r.read().decode("utf-8"))
+            except Exception:
+                continue
+            if key not in norm(meta.get("for", "")):
+                continue
+            parts = meta.get("parts") or [dict(meta, final=True)]     # старый формат — одна часть
+            for p in parts:
+                if p.get("id") in seen or p.get("ts", 0) < t_sent - 2:
+                    continue
+                seen.add(p.get("id"))
+                try:
+                    with urllib.request.urlopen(REPLY_URL + p["wav"], timeout=10) as r:
+                        data = r.read()
                     if gen != _reply_gen[0]:
                         return
-                    if _skip[0]:                            # правый Alt — сразу к следующей части
-                        _skip[0] = False
-                        break
-                    time.sleep(0.1)
-                time.sleep(0.5)
-                _playing[0] = False
-            except Exception as e:
-                _playing[0] = False
-                log(f"не удалось проиграть ответ: {e!r}")
-            if p.get("final"):
-                return
+                    _hist.append((p.get("seq", 1), data))
+                    while len(_hist) > HIST_MAX:            # самую старую часть забываем, указатель сдвигаем вместе с ней
+                        _hist.pop(0)
+                        pos = max(0, pos - 1)
+                    log(f"ответ голосом, часть {p.get('seq', 1)}{' (финал)' if p.get('final') else ''} "
+                        f"({len(p.get('text', ''))} симв.): {p.get('text', '')[:120]}")
+                except Exception as e:
+                    log(f"не удалось получить часть ответа: {e!r}")
+                if p.get("final"):
+                    final = True
+                    break
+    finally:
+        if _live_gen[0] == gen:
+            _live_gen[0] = 0
     log("ответ голосом не дождалась (30 мин)")
 
 
@@ -1067,12 +1153,17 @@ def voice_hotkey(action):
 def main():
     v = Voice()
 
-    alt = {"down": False, "other": False}      # правый Alt считается, только если нажат один, без других клавиш
+    # правый Alt считается, только если нажат один, без других клавиш; двойное нажатие за 0,4 с — «назад» (03.10)
+    alt = {"down": False, "other": False, "last": 0.0, "timer": None}
     rsh = {"down": False, "other": False, "last": 0.0, "timer": None}   # правый Shift — так же, только в одиночку
 
     def rshift_fire():
         rsh["timer"] = None
         voice_hotkey("next")
+
+    def alt_fire():
+        alt["timer"] = None
+        skip_part()
 
     def on_event(e):
         if e.event_type == "down":
@@ -1102,7 +1193,15 @@ def main():
                     alt.update(down=True, other=False)
             else:
                 if alt["down"] and not alt["other"]:
-                    skip_part()
+                    t = time.time()
+                    if alt["timer"] and t - alt["last"] < 0.4:        # второе нажатие — предыдущая часть
+                        alt["timer"].cancel()
+                        alt["timer"] = None
+                        prev_part()
+                    else:                                             # ждём, не будет ли второго нажатия
+                        alt["timer"] = threading.Timer(0.4, alt_fire)
+                        alt["timer"].start()
+                    alt["last"] = t
                 alt["down"] = False
             return
         if e.event_type == "down" and alt["down"]:
@@ -1120,7 +1219,7 @@ def main():
             v.cancelled = True
 
     keyboard.hook(on_event)
-    log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
+    log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа, дважды — предыдущая; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
     keyboard.wait()
 
 
