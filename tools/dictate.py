@@ -52,6 +52,7 @@ NO_SPEECH_SEC = 5.0              # если после «Алёна» тишин
 MIC_STALL_SEC = 5.0              # колбэк микрофона молчит дольше — поток мёртв, переоткрыть
 MIC_FAILS_RESTART = 3            # столько неудачных переоткрытий подряд на консоли — перезапуск всего процесса
 MIN_UPTIME_RESTART = 120.0       # не перезапускаться чаще раза в 2 мин (микрофона нет вовсе — не крутиться)
+GUARD_STALL_SEC = 120.0          # пульс status.json из _wake_step молчит дольше (на консоли) — поток завис, перезапуск
 START_T = time.time()
 STATUS = os.path.join(HERE, "status.json")   # пульс для витрины «Диктовка» (раз в 30 с)
 
@@ -863,10 +864,12 @@ class Voice:
         self.reopen_t = 0.0
         self.reopens = 0
         self.mic_fails = 0
+        self.off_console = False
         self.stream = None
         self._open_stream()
         threading.Thread(target=self._wake_loop, daemon=True).start()
         threading.Thread(target=self._flag_loop, daemon=True).start()
+        threading.Thread(target=self._guard_loop, daemon=True).start()
 
     # 26.09: в 02:42 (Win32k 267 — экран/сон) микрофон K66 перестал отдавать звук, а поток PortAudio не упал и не
     # сообщил ошибку: колбэк просто больше не вызывался. «Алёна» висела на wake_q.get(), диктовка по Ctrl получала
@@ -914,7 +917,10 @@ class Voice:
                 return
         except Exception as e:
             log(f"сеанс: не проверить консоль: {e!r}")
-        log(f"микрофон не открывается {self.mic_fails} раз подряд, сеанс на консоли — перезапускаю процесс")
+        self._restart_process(f"микрофон не открывается {self.mic_fails} раз подряд, сеанс на консоли")
+
+    def _restart_process(self, why):
+        log(f"{why} — перезапускаю процесс")
         try:
             subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=HERE, close_fds=True,
                              creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
@@ -922,6 +928,24 @@ class Voice:
             log(f"перезапуск не удался: {e!r}")
             return
         os._exit(0)
+
+    # 07.10: RDP с 15:42 до 16:21 — 168 переоткрытий «Error querying device -1», на 169-м PortAudio завис внутри
+    # _open_stream: пульс status.json и журнал встали в 16:10, сеанс вернулся на консоль в 16:21, а сторож в том же
+    # потоке — висел, диктовка молчала до ручного перезапуска. Поэтому: (1) вне консоли PortAudio не трогаем вовсе,
+    # только ждём; (2) вернулись на консоль после отлучки — перезапуск процесса сразу, без проб; (3) отдельный
+    # поток-сторож: пульс _wake_step молчит дольше GUARD_STALL_SEC на консоли — перезапуск из другого потока.
+    def _guard_loop(self):
+        while True:
+            time.sleep(15)
+            now = time.time()
+            if now - START_T < MIN_UPTIME_RESTART or now - self.status_t < GUARD_STALL_SEC:
+                continue
+            try:
+                if not self._on_console():
+                    continue
+            except Exception:
+                continue
+            self._restart_process(f"поток «Алёна» не подаёт пульс {now - self.status_t:.0f} с")
 
     def _cb(self, indata, frames, t, status):
         self.last_cb = time.time()
@@ -999,6 +1023,19 @@ class Voice:
         if block is None:
             if now - self.last_cb > MIC_STALL_SEC and now - self.reopen_t > 10:
                 self.reopen_t = now
+                try:
+                    on_console = self._on_console()
+                except Exception as e:
+                    log(f"сеанс: не проверить консоль: {e!r}")
+                    on_console = True
+                if not on_console:
+                    if not self.off_console:
+                        self.off_console = True
+                        log("сеанс не на консоли (RDP или отключён) — микрофона нет, жду возврата")
+                    return
+                if self.off_console and now - START_T >= MIN_UPTIME_RESTART:
+                    self._restart_process("сеанс вернулся на консоль после отлучки")
+                self.off_console = False
                 self.reopens += 1
                 log(f"микрофон молчит {now - self.last_cb:.0f} с — переоткрываю поток (раз {self.reopens})")
                 try:
