@@ -667,8 +667,7 @@ def prev_part():
         if _playing[0]:
             winsound.PlaySound(None, 0)
         log("назад — к предыдущей части ответа")
-    elif _hist:                        # ответ уже дочитан или оборван — повторить его последнюю часть
-        log("назад — повтор последней части ответа")
+    else:                              # ответ уже дочитан или оборван — сыграть непрозвучавшее или повторить последнюю часть
         threading.Thread(target=replay_tail, daemon=True).start()
 
 
@@ -709,7 +708,12 @@ def replay_tail():
     gen = _reply_gen[0]
     _live_gen[0] = gen
     try:
-        pos = len(_hist) - 1
+        новых = добрать_свежее()
+        if not _hist:
+            log("назад — повторять нечего")
+            return
+        log(f"назад — непрозвучавший ответ, частей: {новых}" if новых else "назад — повтор последней части ответа")
+        pos = len(_hist) - max(1, новых)
         while 0 <= pos < len(_hist):
             res = _play_part(_hist[pos], gen)
             if res == "stop":
@@ -767,6 +771,39 @@ def mark_voice(sent):
         log(f"метка голоса не отправлена: {e!r}")
 
 
+_ожидают = []            # (ключ, время отправки) сообщений, на которые ответ ещё не дочитан до финала
+_взяты = set()           # id частей ответа, уже положенных в историю, — чтобы новый ожидающий не сыграл их повторно
+_взята_ts = [0.0]        # время самой свежей взятой части
+
+
+def добрать_свежее():
+    """Положить в историю части ленты, которые ещё не звучали. Возвращает, сколько добавлено.
+
+    12.10.2026: ответ, написанный без сообщения хозяина (вернулась помощница, сработало расписание), никто не ждёт —
+    он озвучен домом, но не проигран и в историю не попадал; двойной Alt повторял предыдущий ответ вместо последнего."""
+    try:
+        with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
+            meta = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        log(f"лента ответа не прочитана: {e!r}")
+        return 0
+    n = 0
+    for p in meta.get("parts") or [dict(meta, final=True)]:
+        if p.get("id") in _взяты or p.get("ts", 0) <= _взята_ts[0]:
+            continue
+        try:
+            with urllib.request.urlopen(REPLY_URL + p["wav"], timeout=10) as r:
+                data = r.read()
+        except Exception as e:
+            log(f"не удалось получить часть ответа: {e!r}")
+            continue
+        _взяты.add(p.get("id")); _взята_ts[0] = p.get("ts", 0)
+        _hist.append((p.get("seq", 1), data))
+        del _hist[:-HIST_MAX]
+        n += 1
+    return n
+
+
 def speak_reply(sent, t_sent, фразы=None):
     """Ждать озвученный ответ Алёны на отправленную голосом фразу и проигрывать его по частям.
 
@@ -778,6 +815,13 @@ def speak_reply(sent, t_sent, фразы=None):
     # 12.10.2026: сообщение диктуется несколькими фразами, которые хозяин потом переставляет и правит («Ой.» стёр, начало
     # заменил) — ключ по одной первой фразе с итоговым текстом не совпадал, и ответ молчал. Теперь годится любая из фраз.
     keys = [k for k in {norm(x)[:40] for x in ([sent] + list(фразы or []))} if len(k) >= 8] or [norm(sent)[:40]]
+    # 12.10.2026: сообщение, отправленное, пока я ещё работаю над предыдущим, попадает в тот же ход — дом озвучивает ответ
+    # как ответ на ПЕРВОЕ сообщение хода. Новое ожидание отменяло прежнее и ждало только свой ключ: ответ на «Проверь линии…»
+    # не прозвучал, потому что следом были отправлены «Напомню…» и «Напомни.». Теперь ключи копятся, пока ответ не дочитан
+    # до финала: годится ответ на любое из неотвеченных сообщений.
+    _ожидают[:] = [(k, t) for k, t in _ожидают if time.time() - t < REPLY_WAIT_SEC] + [(k, t_sent) for k in keys]
+    keys = [k for k, _ in _ожидают]
+    t_sent = min(t for _, t in _ожидают)
     _reply_gen[0] += 1
     gen = _reply_gen[0]
     _live_gen[0] = gen
@@ -822,9 +866,9 @@ def speak_reply(sent, t_sent, фразы=None):
                 continue
             parts = meta.get("parts") or [dict(meta, final=True)]     # старый формат — одна часть
             for p in parts:
-                if p.get("id") in seen or p.get("ts", 0) < t_sent - 2:
+                if p.get("id") in seen or p.get("id") in _взяты or p.get("ts", 0) < t_sent - 2:
                     continue
-                seen.add(p.get("id"))
+                seen.add(p.get("id")); _взяты.add(p.get("id")); _взята_ts[0] = max(_взята_ts[0], p.get("ts", 0))
                 try:
                     with urllib.request.urlopen(REPLY_URL + p["wav"], timeout=10) as r:
                         data = r.read()
@@ -840,6 +884,7 @@ def speak_reply(sent, t_sent, фразы=None):
                     log(f"не удалось получить часть ответа: {e!r}")
                 if p.get("final"):
                     final = True
+                    _ожидают.clear()        # ход закрыт — прежние ключи больше не ждут
                     break
     finally:
         if _live_gen[0] == gen:
