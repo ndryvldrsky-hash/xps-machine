@@ -725,7 +725,7 @@ def replay_tail():
 
 CODE_TITLES = ("Visual Studio Code", "Studio Code Server")
 ARM_SEC = 600              # сколько ждать ручного Enter после диктовки по Ctrl в чат Code
-_armed = {"text": "", "t": 0.0}   # первая продиктованная по Ctrl фраза ещё не отправленного сообщения
+_armed = {"text": "", "t": 0.0, "все": []}   # фразы, продиктованные по Ctrl в ещё не отправленное сообщение; t — время последней
 _enter_рано = [0.0]         # когда нажали Enter, пока диктовка ещё вставляла текст (12.10.2026)
 
 
@@ -735,12 +735,20 @@ def is_code_window(title):
 
 def on_enter():
     """Ручной Enter в чате Code после диктовки по Ctrl — ждать и озвучить ответ, как после «Алёна, …»."""
-    text, t = _armed["text"], _armed["t"]
-    _armed.update(text="", t=0.0)
-    if not text or time.time() - t > ARM_SEC or not is_code_window(foreground_title()):
+    text, t, все = _armed["text"], _armed["t"], list(_armed["все"])
+    _armed.update(text="", t=0.0, все=[])
+    if not text:
         return
-    log(f"Enter после диктовки — жду ответ голосом на «{text[:60]}»")
-    threading.Thread(target=speak_reply, args=(text, time.time()), daemon=True).start()
+    # 12.10.2026: раньше Enter отбрасывался молча — по журналу было не понять, почему ответ не прозвучал
+    if time.time() - t > ARM_SEC:
+        log(f"Enter после диктовки — не жду ответ: с последней фразы прошло {time.time() - t:.0f} с (предел {ARM_SEC})")
+        return
+    title = foreground_title()
+    if not is_code_window(title):
+        log(f"Enter после диктовки — не жду ответ: впереди окно «{title[:60]}», не чат")
+        return
+    log(f"Enter после диктовки — жду ответ голосом на «{text[:60]}» (фраз в сообщении: {len(все)})")
+    threading.Thread(target=speak_reply, args=(text, time.time(), все), daemon=True).start()
 
 
 def norm(t):
@@ -759,7 +767,7 @@ def mark_voice(sent):
         log(f"метка голоса не отправлена: {e!r}")
 
 
-def speak_reply(sent, t_sent):
+def speak_reply(sent, t_sent, фразы=None):
     """Ждать озвученный ответ Алёны на отправленную голосом фразу и проигрывать его по частям.
 
     Ответ готовит voice_reply.py в аддоне на Нуксе: /local/voice_reply/voice_reply.json — лента хода
@@ -767,7 +775,9 @@ def speak_reply(sent, t_sent):
     промежуточные сообщения хода: части играются по порядку, одна за другой, до части с final. Сопоставление —
     по началу отправленного текста в поле `for`."""
     mark_voice(sent)
-    key = norm(sent)[:40]
+    # 12.10.2026: сообщение диктуется несколькими фразами, которые хозяин потом переставляет и правит («Ой.» стёр, начало
+    # заменил) — ключ по одной первой фразе с итоговым текстом не совпадал, и ответ молчал. Теперь годится любая из фраз.
+    keys = [k for k in {norm(x)[:40] for x in ([sent] + list(фразы or []))} if len(k) >= 8] or [norm(sent)[:40]]
     _reply_gen[0] += 1
     gen = _reply_gen[0]
     _live_gen[0] = gen
@@ -808,7 +818,7 @@ def speak_reply(sent, t_sent):
                     meta = json.loads(r.read().decode("utf-8"))
             except Exception:
                 continue
-            if key not in norm(meta.get("for", "")):
+            if not any(k in norm(meta.get("for", "")) for k in keys):
                 continue
             parts = meta.get("parts") or [dict(meta, final=True)]     # старый формат — одна часть
             for p in parts:
@@ -1159,12 +1169,14 @@ class Voice:
             if send:
                 time.sleep(0.15)
                 keyboard.send("enter")
-                _armed.update(text="", t=0.0)          # сообщение ушло само — ручного Enter ждать нечего
+                _armed.update(text="", t=0.0, все=[])   # сообщение ушло само — ручного Enter ждать нечего
                 threading.Thread(target=speak_reply, args=(text, time.time()), daemon=True).start()
-            elif code_win and not _armed["text"]:
+            elif code_win:
                 # диктовка правым Ctrl в чат Code: ответ озвучим, когда пользователь сам нажмёт Enter (28.09).
                 # Ключ сопоставления — ПЕРВАЯ фраза сообщения: следующие диктовки до Enter её не перезаписывают.
-                _armed.update(text=text, t=time.time())
+                # 12.10: запоминаем каждую фразу сообщения и время последней — срок ожидания Enter считается от неё
+                _armed["все"].append(text)
+                _armed.update(text=_armed["text"] or text, t=time.time())
         finally:
             self.busy = False
         # 12.10.2026: хозяин сказал «Готово.» и нажал Enter раньше, чем закончилась вставка — Enter был отброшен как «занято»,
