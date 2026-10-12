@@ -726,6 +726,7 @@ def replay_tail():
 CODE_TITLES = ("Visual Studio Code", "Studio Code Server")
 ARM_SEC = 600              # сколько ждать ручного Enter после диктовки по Ctrl в чат Code
 _armed = {"text": "", "t": 0.0}   # первая продиктованная по Ctrl фраза ещё не отправленного сообщения
+_enter_рано = [0.0]         # когда нажали Enter, пока диктовка ещё вставляла текст (12.10.2026)
 
 
 def is_code_window(title):
@@ -1166,6 +1167,12 @@ class Voice:
                 _armed.update(text=text, t=time.time())
         finally:
             self.busy = False
+        # 12.10.2026: хозяин сказал «Готово.» и нажал Enter раньше, чем закончилась вставка — Enter был отброшен как «занято»,
+        # ответ не озвучился, а фраза осталась взведённой и подменила ключ следующего сообщения. Такой ранний Enter запоминаем
+        # и отрабатываем здесь, сразу после вставки.
+        if _armed["text"] and time.time() - _enter_рано[0] < 3:
+            _enter_рано[0] = 0.0
+            on_enter()
 
 
 def voice_hotkey(action):
@@ -1243,9 +1250,11 @@ def main():
             return
         if e.event_type == "down" and alt["down"]:
             alt["other"] = True
-        if e.event_type == "down" and e.name == "enter" and _armed["text"] \
-                and not keyboard.is_pressed("shift") and not v.busy:    # Shift+Enter в чате — перенос строки
-            on_enter()
+        if e.event_type == "down" and e.name == "enter" and not keyboard.is_pressed("shift"):   # Shift+Enter в чате — перенос строки
+            if v.busy:
+                _enter_рано[0] = time.time()     # вставка ещё идёт — отработаем в конце _deliver2
+            elif _armed["text"]:
+                on_enter()
         if e.name == HOTKEY:
             if e.event_type == "down":
                 stop_reply()
