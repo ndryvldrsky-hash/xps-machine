@@ -50,6 +50,18 @@ KEY_QUIET_SEC = 0.8              # звук в пределах 0,8 с от на
 SILENCE_END_SEC = 1.0            # пауза, завершающая фразу
 MAX_UTT_SEC = 25.0
 NO_SPEECH_SEC = 5.0              # если после «Алёна» тишина — отмена
+def _virtual_mic(name):
+    """Виртуальный звуковой кабель (VB-Audio CABLE и подобные) и «устройство по умолчанию» Windows под своим именем
+    (Sound Mapper / «Переназначение звуковых устр.», Primary Sound Capture) — не микрофон: первый отдаёт тишину,
+    второе — лишь ссылка на то же устройство по умолчанию."""
+    n = (name or "").upper()
+    return any(x in n for x in ("CABLE", "VB-AUDIO", "VOICEMEETER", "SOUND MAPPER", "PRIMARY SOUND", "ПЕРЕНАЗНАЧЕНИЕ", "ПЕРВИЧНЫЙ"))
+
+
+MIC_PREFER = "K66"               # микрофон хозяина: если он есть в списке — берём его, что бы ни стояло по умолчанию
+MIC_DEAD_RMS = 3.0               # громкость не выше этой 30 с подряд — цифровая тишина, у живого микрофона так не бывает
+
+
 MIC_STALL_SEC = 5.0              # колбэк микрофона молчит дольше — поток мёртв, переоткрыть
 MIC_FAILS_RESTART = 3            # столько неудачных переоткрытий подряд на консоли — перезапуск всего процесса
 MIN_UPTIME_RESTART = 120.0       # не перезапускаться чаще раза в 2 мин (микрофона нет вовсе — не крутиться)
@@ -919,6 +931,7 @@ class Voice:
         self.win_max = 0.0
         self.last_cb = time.time()
         self.reopen_t = 0.0
+        self.dead_max = 0.0; self.dead_n = 0      # наибольшая громкость за последние 30–60 с и число прошедших полуминут
         self.reopens = 0
         self.mic_fails = 0
         self.off_console = False
@@ -946,11 +959,28 @@ class Voice:
                 sd._initialize()
             except Exception as e:
                 log(f"микрофон: PortAudio не переинициализировался: {e!r}")
+        idx = None
         try:
-            dev = sd.query_devices(kind="input")["name"]
+            info = sd.query_devices(kind="input")
+            dev = info["name"]
+            # 13.10.2026: в 10:55 после короткого сбоя K66 устройством по умолчанию на миг оказался виртуальный кабель
+            # «CABLE Output» — поток открылся на нём и остался: кабель исправно зовёт колбэк, но отдаёт чистую тишину,
+            # сторож «микрофон молчит» этого не видит, диктовка по клавише приносила пустые записи. Виртуальный кабель
+            # микрофоном не считаем: берём настоящий вход того же звукового интерфейса, K66 — первым.
+            # 13.10.2026 11:06: первая правка взяла «Переназначение звуковых устр. - Input» — это то же устройство по
+            # умолчанию, снова кабель. Теперь: есть K66 — берём его всегда; нет, а по умолчанию виртуальное — первый настоящий.
+            real = [(i, d["name"]) for i, d in enumerate(sd.query_devices())
+                    if d["max_input_channels"] > 0 and d["hostapi"] == info["hostapi"] and not _virtual_mic(d["name"])]
+            свой = [x for x in real if MIC_PREFER in x[1]]
+            if свой and MIC_PREFER not in dev:
+                log(f"микрофон по умолчанию — {dev}; беру {свой[0][1]}")
+                idx, dev = свой[0]
+            elif _virtual_mic(dev) and real:
+                log(f"микрофон по умолчанию — виртуальный ({dev}); беру {real[0][1]}")
+                idx, dev = real[0]
         except Exception:
             dev = "?"
-        self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=BLOCK, callback=self._cb)
+        self.stream = sd.InputStream(device=idx, samplerate=RATE, channels=1, dtype="int16", blocksize=BLOCK, callback=self._cb)
         self.stream.start()
         self.last_cb = time.time()
         self.mic = dev
@@ -1077,6 +1107,20 @@ class Voice:
         if now - self.status_t > 30:
             self.status_t = now
             self._write_status(now)
+            # Раз в 30 с: поток сидит не на том устройстве или отдаёт цифровую тишину — переоткрыть (PortAudio заново читает
+            # список, вернувшийся K66 находится). Не на K66 — проверяем раз в 60 с, пока идёт запись по клавише — не трогаем.
+            мёртв = self.dead_n >= 1 and self.dead_max <= MIC_DEAD_RMS
+            чужой = MIC_PREFER not in (self.mic or "") and now - self.reopen_t > 60
+            self.dead_n += 1
+            if self.dead_n > 1: self.dead_max = 0.0; self.dead_n = 1
+            if (мёртв or _virtual_mic(self.mic) or чужой) and not self.rec and now - self.reopen_t > 30:
+                self.reopen_t = now
+                try:
+                    if self._on_console():
+                        log(f"микрофон: {'цифровая тишина' if мёртв else 'не тот вход'} ({self.mic}) — переоткрываю")
+                        self._open_stream(); self.dead_max = 0.0; self.dead_n = 0
+                except Exception as e:
+                    log(f"микрофон не переоткрылся: {e!r}")
         if block is None:
             if now - self.last_cb > MIC_STALL_SEC and now - self.reopen_t > 10:
                 self.reopen_t = now
@@ -1106,6 +1150,7 @@ class Voice:
         rms = float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
         now = time.time()
         self.win_max = max(self.win_max, rms)
+        self.dead_max = max(self.dead_max, rms)
         if DEBUG and now - self.dbg_t > 30:
             self.dbg_t = now
             log(f"слушаю: макс rms за 30 с={self.win_max:.0f} шум={self.noise:.0f} порог={self._thr():.0f} проб={self.probes} отсеяно={self.skipped}")
