@@ -10,8 +10,18 @@
    (правый Ctrl — оборвать весь ответ, короткий правый Alt — пропустить часть и перейти к следующей,
    двойной правый Alt — вернуться к предыдущей, в тишине — повторить последнюю; история — 30 частей
    через все ответы, новая часть не перебивает ту, что слушают, а ждёт своей очереди).
+   16.10.2026: часть с метками предложений (marks в voice_reply.json) играет sounddevice с позиции; пока звучит озвучка,
+   перехвачены две клавиши НАМПАДА (с 16.10 поменяны местами): Enter — к началу предыдущего предложения (если с начала текущего прошло > 1,5 с — к началу
+   текущего), «.» нампада — к следующему предложению. В тишине клавиши свободны. Части без marks — как раньше (winsound).
+   16.10.2026 (поздно): озвучка ПОТОКОМ — каждое предложение отдельная часть ленты (поля msg — номер сообщения хода, sent — номер
+   предложения), звук начинается с первого предложения, остальные подгружаются по мере появления. Нампад: «.» — следующая часть
+   (предложение), Enter — предыдущая, двойной Enter за 0,35 с — текущая заново; правый Alt — к первой части СЛЕДУЮЩЕГО сообщения,
+   двойной правый Alt — к началу текущего сообщения (если с его начала > 1,5 с) или предыдущего; история — 300 частей.
+   Части без поля msg (старый формат, в т.ч. с marks) — по-старому.
    Диктовка правым Ctrl в чат Code тоже получает ответ голосом — после ручного Enter (без Shift), до 10 мин.
    (voice_reply.py в аддоне Студии, в Штабе; голос Gemini, запасные Silero и Piper).
+   16.10.2026 (хозяин): нампад — Backspace пауза/продолжить; «+»/«−» — темп ТЕКУЩЕГО предложения (шаги 0,6…1,3; предложение озвучивается
+   заново Gemini TTS с подсказкой темпа, пока оно готовится ~3–5 с — тишина), «*» — темп к норме. Коррекция помнится за предложением.
    (Vosk small-ru не подошёл: в его словаре нет имени «Алёна».)
 
 Распознавание локальное, модель GigaAM v3 e2e через onnx-asr (Wyoming, порт 10300): сначала Кузница
@@ -22,7 +32,7 @@
 Выключить режим «Алёна», не трогая диктовку: создать файл no_wake рядом со скриптом (проверяется каждую секунду).
 Запуск: задача планировщика «AlenaDictate» при входе rdpuser (pythonw). Лог — dictate.log рядом.
 """
-import collections, ctypes, io, wave, datetime, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.request, winsound
+import collections, ctypes, io, wave, datetime, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.error, urllib.request, winsound
 from ctypes import wintypes
 
 import keyboard
@@ -652,8 +662,289 @@ _playing = [False]
 _skip = [False]            # правый Alt: оборвать текущую часть ответа и перейти к следующей
 _back = [False]            # двойной правый Alt: вернуться к предыдущей части (03.10)
 _hist = []                 # последние сыгранные части через ВСЕ ответы подряд: (подпись, WAV-байты) — по ним ходит «назад»
-HIST_MAX = 30              # сколько частей помнить (WAV лежат в памяти: ~1,5 МБ на полминуты речи)
+HIST_MAX = 300             # сколько частей помнить (WAV лежат в памяти: ~1,5 МБ на полминуты речи)
+_skipmsg = [False]         # правый Alt (а не «.» нампада): пропуск идёт к следующему СООБЩЕНИЮ, а не к следующей части (16.10)
+_cur_msg = [None, 0.0]     # (ключ сообщения (ход, msg), когда оно начало звучать) — для двойного Alt «к началу или к предыдущему»
+_skip_key = [None]         # сообщение, к чьему концу прыгнули Alt-ом, пока его части ещё публикуются: их не играем
+MSG_BACK_SEC = 1.5         # двойной правый Alt: если с начала текущего сообщения прошло больше — к его началу, иначе к началу предыдущего
 _live_gen = [0]            # номер хода, чей цикл проигрывания сейчас жив (0 — никто не играет и не ждёт частей)
+
+
+# ---- 16.10.2026: проигрывание с позиции и переход по предложениям (нампад) ----
+SENT_BACK_SEC = 1.5         # «назад»: если с начала текущего предложения прошло больше — к началу текущего, иначе к предыдущему
+OUT_DEVICE_FILE = os.path.join(HERE, "out_device")   # необязательно: номер или кусок имени устройства вывода (если звук идёт не туда)
+_paused = [False]           # 16.10.2026: пауза озвучки (Backspace), общая для всех частей
+_nav = [None]               # «prev» / «next» от нампада — забирает цикл проигрывания части
+_np_state = {"remove": None, "held": set()}
+_np_lock = threading.Lock()
+_out_dev_logged = [False]
+
+
+def nav_target(marks, t, key):
+    """Куда прыгнуть по клавише нампада. marks — начала предложений (с), t — текущая позиция (с).
+    Возвращает ('seek', секунды) | ('prevpart', None) — назад за начало части | ('nextpart', None) — вперёд за конец части."""
+    i = 0
+    for k, m in enumerate(marks):
+        if m <= t + 0.001:
+            i = k
+    if key == "again":                 # 16.10 хозяин: двойной Enter нампада — текущее предложение заново
+        return ("seek", marks[i])
+    if key == "prev":                  # одиночный Enter — сразу к предыдущему предложению
+        if t - marks[i] > SENT_BACK_SEC and False:   # прежнее «к началу текущего» отдано двойному нажатию
+            return ("seek", marks[i])
+        if i > 0:
+            return ("seek", marks[i - 1])
+        return ("prevpart", None)
+    if i + 1 < len(marks):
+        return ("seek", marks[i + 1])
+    return ("nextpart", None)
+
+
+def _np_filter(e):
+    """Блокирующий хук keyboard (стоит ТОЛЬКО пока звучит озвучка): глотаются и превращаются в команды
+      «.» нампада (скан-код 83 + is_keypad; и при выключенном NumLock) — к следующему предложению, Enter нампада (28 + keypad) — к предыдущему,
+      Backspace (скан-код 14, 16.10.2026 хозяин) — пауза/продолжить, «+» нампада (78 + keypad) — темп текущего предложения быстрее,
+      «−» нампада (74 + keypad) — медленнее, «*» нампада (55 + keypad) — темп к норме.
+    ВАЖНО: Backspace нампада и обычный Backspace — один и тот же скан-код 14 (keyboard их не различает), поэтому на время озвучки
+    перехватывается ЛЮБОЙ Backspace, пока звучит озвучка или стоит пауза (хук на паузе остаётся) — стирать текст клавишей Backspace в это
+    время нельзя: сначала правый Ctrl/Alt (стоп) или дослушать. Какие коды шлёт именно нампадный Backspace — видно по строкам «клавиша: …» в журнале.
+    Всё остальное — True (клавиша идёт дальше как обычно). Должен работать мгновенно: вызывается на каждое нажатие."""
+    try:
+        sc, kp = e.scan_code, bool(getattr(e, "is_keypad", False))
+        # 16.10.2026 хозяин: пауза — «0» нампада (скан-код 82 + keypad), не Backspace: тот шлёт один код с обычным и мешал бы стирать
+        if kp:
+            k = {83: "next", 28: "prev", 74: "slower", 78: "faster", 55: "reset", 82: "pause"}.get(sc)
+        else:
+            k = None
+        held = _np_state["held"]
+        # 16.10.2026: журнал нажатий командных клавиш во время озвучки — проверить вживую, шлёт ли нампадный Backspace что-то иное
+        # (только эти скан-коды: остальной набор текста в журнал не попадает)
+        if e.event_type == "down" and sc in (14, 28, 55, 74, 78, 83) and (k is None or k not in held):
+            log(f"клавиша: {getattr(e, 'name', None)}/{sc}/{kp}" + (f" — перехвачена ({k})" if k else " — пропущена"))
+        if k is None:
+            return True
+        if e.event_type == "down":
+            if k not in held:                 # автоповтор удержания — одна команда
+                held.add(k)
+                _nav[0] = k
+            return False
+        if k in held:                         # отпускание той клавиши, нажатие которой мы проглотили
+            held.discard(k)
+            return False
+        return True                           # нажали до включения перехвата — отпускание пропускаем
+    except Exception:
+        return True
+
+
+_np_timer = [None]
+
+
+def _np_off_soon(delay=0.5):
+    """Снять перехват нампада не сразу, а через delay с, если следующая часть не успела его снова взять (между предложениями
+    озвучки — доли секунды, хук не переустанавливаем; в настоящей тишине клавиши отпускаются)."""
+    def fire(me):
+        with _np_lock:
+            if _np_timer[0] is not me:
+                return
+            _np_timer[0] = None
+        _np_off()
+    with _np_lock:
+        t = threading.Timer(delay, lambda: fire(t))
+        t.daemon = True
+        _np_timer[0] = t
+        t.start()
+
+
+def _np_on():
+    with _np_lock:
+        _np_timer[0] = None
+        if _np_state["remove"] is None:
+            try:
+                _np_state["held"].clear()
+                _np_state["remove"] = keyboard.hook(_np_filter, suppress=True)
+            except Exception as e:
+                log(f"перехват нампада не включился: {e!r}")
+
+
+def _np_off():
+    with _np_lock:
+        rm, _np_state["remove"] = _np_state["remove"], None
+        _nav[0] = None
+        if rm is not None:
+            try:
+                rm()
+            except Exception as e:
+                log(f"перехват нампада не снялся: {e!r}")
+
+
+def _out_device():
+    """Устройство вывода для sounddevice. winsound играет в «Переназначение звуковых устройств» MME (то, что выбрано в Windows);
+    чтобы звук шёл ровно туда же (26.09 sounddevice по умолчанию попадал не в то устройство — на SHARP HDMI было не слышно),
+    берём MME «Microsoft Sound Mapper - Output». Переопределить — файл out_device рядом со скриптом."""
+    try:
+        want = open(OUT_DEVICE_FILE, encoding="utf-8").read().strip()
+    except Exception:
+        want = ""
+    devs = sd.query_devices()
+    if want:
+        if want.isdigit():
+            return int(want)
+        for i, d in enumerate(devs):
+            if d["max_output_channels"] > 0 and want.lower() in d["name"].lower():
+                return i
+    try:
+        for h in sd.query_hostapis():
+            if h["name"] == "MME":
+                for i in h["devices"]:
+                    if devs[i]["max_output_channels"] > 0 and devs[i]["name"].startswith("Microsoft Sound Mapper"):
+                        return i
+    except Exception:
+        pass
+    return None
+
+
+class _SdPlayer:
+    """WAV в памяти → OutputStream с колбэком, позицию можно менять на лету (seek)."""
+
+    def __init__(self, data):
+        with wave.open(io.BytesIO(data)) as w:
+            self.rate, ch, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
+            raw = w.readframes(w.getnframes())
+        if width != 2:
+            raise ValueError(f"WAV не 16 бит ({width * 8})")
+        self.a = np.frombuffer(raw, dtype="<i2").reshape(-1, ch)
+        self.ch, self.n, self.pos = ch, len(self.a), 0
+        self.lock = threading.Lock()
+        self.stream = None
+        self.end_t = None
+        self.stall = (0, time.time())
+        self.lat = 0.2
+        self.paused = _paused[0]       # 16.10: пауза (Backspace) держится и на следующих частях
+
+    def _cb(self, outdata, frames, tinfo, status):
+        if self.paused:                # пауза: тишина, позиция стоит
+            outdata[:] = 0
+            return
+        with self.lock:
+            p = self.pos
+            e = min(p + frames, self.n)
+            k = e - p
+            if k > 0:
+                outdata[:k] = self.a[p:e]
+            if k < frames:
+                outdata[max(k, 0):] = 0
+            self.pos = max(e, p)
+
+    def start(self):
+        dev = _out_device()
+        self.stream = sd.OutputStream(samplerate=self.rate, channels=self.ch, dtype="int16", device=dev, callback=self._cb)
+        if not _out_dev_logged[0]:
+            _out_dev_logged[0] = True
+            try:
+                d = sd.query_devices(self.stream.device)
+                log(f"озвучка с позиции: устройство {self.stream.device} «{d['name']}», {self.rate} Гц, задержка {self.stream.latency:.2f} с")
+            except Exception:
+                pass
+        self.lat = float(self.stream.latency or 0.2)
+        self.stream.start()
+
+    def seek(self, sec):
+        with self.lock:
+            self.pos = max(0, min(self.n, int(sec * self.rate)))
+            self.end_t = None
+
+    def now(self):
+        """Позиция в секундах (по очереди колбэка; она на задержку устройства впереди слышимого — для прыжков не важно)."""
+        return self.pos / self.rate
+
+    def finished(self):
+        try:
+            if not self.stream.active:         # поток убит (sd._terminate при переоткрытии микрофона)
+                return True
+        except Exception:
+            return True
+        if self.paused:                        # 16.10: на паузе позиция стоит — это не «колбэк замолчал» (раньше через 3 с часть
+            self.stall = (self.pos, time.time())   # считалась законченной и пауза «перелистывала» предложения)
+            return False
+        if self.pos >= self.n:
+            if self.end_t is None:
+                self.end_t = time.time()
+            return time.time() - self.end_t > self.lat + 0.1
+        if self.pos != self.stall[0]:
+            self.stall = (self.pos, time.time())
+        elif time.time() - self.stall[1] > 3:  # колбэк замолчал
+            return True
+        return False
+
+    def close(self):
+        try:
+            if self.stream is not None:
+                self.stream.abort()
+                self.stream.close()
+        except Exception:
+            pass
+
+
+def _msg_start(pos):
+    """Индекс первой части того же сообщения, что и _hist[pos] (ключ None — сама часть)."""
+    k = _hist[pos][3] if len(_hist[pos]) > 3 else None
+    if k is None:
+        return pos
+    while pos > 0 and len(_hist[pos - 1]) > 3 and _hist[pos - 1][3] == k:
+        pos -= 1
+    return pos
+
+
+def _enter_msg(j):
+    """Перешли к началу сообщения j: «с начала сообщения» отсчитывается заново."""
+    if 0 <= j < len(_hist) and len(_hist[j]) > 3 and _hist[j][3] is not None:
+        _cur_msg[:] = [_hist[j][3], time.time()]
+    return j
+
+
+def _apply_skip(pos):
+    """После прыжка к следующему сообщению, пока его предшественник ещё доезжает в ленту, оставшиеся его части пропускаем."""
+    k = _skip_key[0]
+    while k is not None and pos < len(_hist) and len(_hist[pos]) > 3 and _hist[pos][3] == k:
+        pos += 1
+    if pos < len(_hist) and (len(_hist[pos]) <= 3 or _hist[pos][3] != k):
+        _skip_key[0] = None
+    return pos
+
+
+def _step(res, pos):
+    """Куда идти по результату _play_part: (новая позиция в _hist, с какого места играть: 0 или 'last').
+    16.10: для частей нового формата (есть ключ сообщения) — 'nextmsg' (правый Alt) и 'back' (двойной правый Alt) ходят по
+    сообщениям; 'skip'/'prev' (нампад) — по частям (предложениям); 'last' для них не нужен (часть — одно предложение)."""
+    key = _hist[pos][3] if 0 <= pos < len(_hist) and len(_hist[pos]) > 3 else None
+    if key is not None and res == "nextmsg":
+        j = pos + 1
+        while j < len(_hist) and len(_hist[j]) > 3 and _hist[j][3] == key:
+            j += 1
+        _skip_key[0] = key if j >= len(_hist) else None
+        return _enter_msg(j), 0
+    if key is not None and res == "back":
+        first = _msg_start(pos)
+        elapsed = time.time() - _cur_msg[1] if _cur_msg[0] == key else 999
+        if elapsed > MSG_BACK_SEC or first == 0:
+            return _enter_msg(first), 0                 # к началу текущего сообщения
+        return _enter_msg(_msg_start(first - 1)), 0     # к началу предыдущего
+    if res == "nextmsg":
+        res = "skip"
+    if res == "back":
+        return max(0, pos - 1), 0
+    if res == "prev":                          # «.» в самом начале части — к последнему предложению предыдущей
+        return (pos - 1, "last") if pos > 0 else (0, 0)
+    return pos + 1, 0
+
+
+def _tail_pos(новых=0):
+    """С какой части играть, когда ничего не звучит (двойной Alt в тишине / повтор): новое непрозвучавшее; иначе — для частей
+    нового формата начало последнего сообщения, для старых — последняя часть."""
+    pos = len(_hist) - max(1, новых)
+    if not новых and len(_hist[pos]) > 3 and _hist[pos][3] is not None:
+        return _enter_msg(_msg_start(pos))
+    return pos
 
 
 def stop_reply():
@@ -661,6 +952,7 @@ def stop_reply():
     if _playing[0]:
         _playing[0] = False
         _reply_gen[0] += 1             # ожидание следующих частей этого хода тоже прекращается
+        _paused[0] = False
         winsound.PlaySound(None, 0)
         log("ответ голосом прерван")
 
@@ -668,9 +960,10 @@ def stop_reply():
 def skip_part():
     """Правый Alt: оборвать текущую часть ответа, следующие части хода играют дальше."""
     if _playing[0]:
+        _skipmsg[0] = True             # части нового формата: к первой части следующего сообщения; старые — к следующей части
         _skip[0] = True
         winsound.PlaySound(None, 0)
-        log("часть ответа пропущена — к следующей")
+        log("правый Alt — к следующему сообщению (старый формат — к следующей части)")
 
 
 def prev_part():
@@ -684,16 +977,311 @@ def prev_part():
         threading.Thread(target=replay_tail, daemon=True).start()
 
 
-def _play_part(item, gen):
+def _play_part(item, gen, start=0):
+    """Сыграть одну часть ответа. Часть с marks — sounddevice с позиции (старт с начала или с последнего предложения),
+    под перехватом «.»/Enter нампада; без marks (или если устройство вывода не открылось) — как раньше, winsound.
+    Возвращает 'done', 'skip', 'back', 'prev' (нампад: назад за начало части) или 'stop'."""
+    if len(item) > 3 and item[3] is not None:      # 16.10: часть нового формата — одно предложение, без marks
+        return _play_part_msg(item, gen)
+    marks = item[2] if len(item) > 2 else None
+    if marks and all(isinstance(m, (int, float)) for m in marks):
+        try:
+            player = _SdPlayer(item[1])
+            player.start()
+        except Exception as e:
+            log(f"sounddevice не сыграл ({e!r}) — играю как раньше, без перехода по предложениям")
+            player = None
+        if player is not None:
+            return _play_part_sd(player, sorted(marks), gen, start)
+    return _play_part_ws(item, gen)
+
+
+# ---- 16.10.2026: темп отдельного предложения (нампад «+»/«−»/«*») ----
+SPEED_STEPS = (0.6, 0.75, 0.9, 1.0, 1.15, 1.3)
+SPEED_HOOK = "alena_golos_skorost"   # вебхук HA → input_text.golos_skorost «id|темп|nonce» → поток speed_loop в voice_reply.py (Студия) делает вариант
+VAR_WAIT_SEC = 45           # сколько ждать готовый вариант (обычно 3–5 с)
+VAR_CACHE_MAX = 40
+_speed = {}                 # id части → запомненный темп (нет записи — норма 1,0); живёт, пока работает программа
+_variants = {}              # (id части, темп) → WAV-байты варианта (кэш; на Студии варианты лежат файлами <id>_x<темп>.wav)
+_var_busy, _var_fail = set(), set()
+_var_lock = threading.Lock()
+
+
+def speed_step(cur, key):
+    """Следующий темп из SPEED_STEPS: 'faster' — на шаг быстрее, 'slower' — медленнее, 'reset' — 1,0. На краю остаётся тот же."""
+    if key == "reset":
+        return 1.0
+    i = min(range(len(SPEED_STEPS)), key=lambda j: abs(SPEED_STEPS[j] - cur))
+    i = min(len(SPEED_STEPS) - 1, i + 1) if key == "faster" else max(0, i - 1)
+    return SPEED_STEPS[i]
+
+
+def _fetch_variant(pid, k):
+    """Поток: взять вариант части pid с темпом k — готовый файл на Студии, а если его нет, попросить вебхуком и ждать появления.
+    Результат — в _variants[(pid, k)], при неудаче — (pid, k) в _var_fail."""
+    key = (pid, k)
+    url = REPLY_URL + f"{pid}_x{k:.2f}.wav"
+    nonce = str(int(time.time() * 1000) % 10 ** 9)      # отличает этот запрос от прежних (input_text не меняется при том же значении)
+
+    def get_err():
+        """Студия не смогла сделать вариант: рядом лежит .err «nonce|причина» (только если nonce наш)."""
+        try:
+            with urllib.request.urlopen(url[:-4] + ".err?_=%d" % time.time(), timeout=5) as r:
+                t = r.read().decode("utf-8", "replace")
+            return t if t.split("|", 1)[0] == nonce else None
+        except Exception:
+            return None
+
+    def get():
+        try:
+            with urllib.request.urlopen(url + "?_=%d" % time.time(), timeout=8) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
+    try:
+        data = get()
+        if data is None:
+            req = urllib.request.Request(f"http://{HOST}:8123/api/webhook/{SPEED_HOOK}", method="POST",
+                                         data=json.dumps({"id": pid, "k": k, "n": nonce}).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5).read()
+            t0 = time.time()
+            while data is None and time.time() - t0 < VAR_WAIT_SEC:
+                time.sleep(0.4)
+                data = get()
+                if data is None:
+                    err = get_err()
+                    if err:
+                        raise RuntimeError("Студия: " + err.split("|", 1)[-1][:120])
+        if data is None:
+            raise TimeoutError(f"вариант не появился за {VAR_WAIT_SEC} с")
+        with wave.open(io.BytesIO(data)) as w:        # проверка, что это настоящий WAV 16 бит
+            if w.getsampwidth() != 2:
+                raise ValueError("вариант не 16 бит")
+        _variants[key] = data
+        while len(_variants) > VAR_CACHE_MAX:
+            _variants.pop(next(iter(_variants)))
+        log(f"вариант темпа {k} для {pid} получен ({len(data) // 1024} КБ)")
+    except Exception as e:
+        _var_fail.add(key)
+        log(f"вариант темпа {k} для {pid} не получен: {e!r}")
+    finally:
+        with _var_lock:
+            _var_busy.discard(key)
+
+
+def _fetch_start(pid, k):
+    key = (pid, k)
+    with _var_lock:
+        if key in _var_busy:
+            return
+        _var_busy.add(key)
+        _var_fail.discard(key)
+    threading.Thread(target=_fetch_variant, args=(pid, k), daemon=True).start()
+
+
+def _play_part_msg(item, gen):
+    """Часть-предложение нового формата: sounddevice, нампад под перехватом. «.» — к следующей части, Enter — к предыдущей,
+    двойной Enter за 0,35 с — эта часть заново; Backspace — пауза; «+»/«−»/«*» — темп ЭТОГО предложения (вариант Gemini с другим
+    темпом, пока он готовится — тишина, потом играет с начала; темп помнится за предложением). После конца части пауза не
+    добавляется (тишина уже в самом WAV), _playing остаётся поднятым до простоя цикла — правый Ctrl/Alt работают и в щели между
+    предложениями. Возвращает 'done', 'skip', 'prev', 'nextmsg' (правый Alt), 'back' (двойной правый Alt) или 'stop'."""
+    if item[3] != _cur_msg[0]:
+        _cur_msg[:] = [item[3], time.time()]
+    pid = item[5] if len(item) > 5 else None
+    want = _speed.get(pid, 1.0) if pid else 1.0         # запомненный темп этого предложения
+    playing = 1.0                                       # какой темп сейчас в плеере
+    if want != 1.0 and (pid, want) in _variants:
+        data, playing = _variants[(pid, want)], want
+    else:
+        data = item[1]
+    try:
+        player = _SdPlayer(data)
+        player.start()
+    except Exception as e:
+        log(f"sounddevice не сыграл ({e!r}) — играю как раньше, без нампада")
+        return _play_part_ws(item, gen)
+    waiting = False                                     # ждём вариант: оригинал молчит на паузе
+    if want != playing:
+        waiting = True
+        player.paused = True
+        _fetch_start(pid, want)
+        log(f"предложение {pid}: темп {want} — готовлю вариант")
+    _playing[0] = True
+    _skip[0] = _back[0] = _skipmsg[0] = False
+    _nav[0] = None
+    _np_on()
+    res = "done"
+
+    def swap(new_data, new_k):
+        """Переключить плеер на другой WAV (вариант или оригинал) — с начала."""
+        nonlocal player, playing, waiting
+        p2 = _SdPlayer(new_data)               # p2.paused берётся из общей паузы
+        p2.start()
+        old, player = player, p2
+        old.close()
+        playing, waiting = new_k, False
+
+    try:
+        while not player.finished():
+            if gen != _reply_gen[0]:
+                res = "stop"
+                break
+            if _back[0]:
+                _back[0] = False
+                res = "back"
+                break
+            if _skip[0]:
+                res = "nextmsg" if _skipmsg[0] else "skip"
+                _skip[0] = _skipmsg[0] = False
+                break
+            if waiting:                          # вариант готов / не получился / запрос отменён
+                want = _speed.get(pid, 1.0)
+                try:
+                    if want == playing:
+                        waiting = False
+                        player.paused = _paused[0]
+                    elif want == 1.0:
+                        swap(item[1], 1.0)
+                    elif (pid, want) in _variants:
+                        swap(_variants[(pid, want)], want)
+                        log(f"предложение {pid}: играю вариант темпа {want}")
+                    elif (pid, want) in _var_fail:
+                        log(f"предложение {pid}: вариант темпа {want} не вышел — остаюсь на {playing}")
+                        _speed.pop(pid, None) if playing == 1.0 else _speed.__setitem__(pid, playing)
+                        waiting = False
+                        player.paused = _paused[0]
+                except Exception as e:
+                    log(f"смена темпа: плеер не открылся ({e!r})")
+                    waiting = False
+                    player.paused = _paused[0]
+            key, _nav[0] = _nav[0], None
+            if key == "pause":
+                _paused[0] = not _paused[0]
+                player.paused = _paused[0] or waiting
+                log("нампад: «0» — " + ("пауза" if _paused[0] else "продолжаю"))
+                continue
+            if key in ("faster", "slower", "reset"):
+                if not pid:
+                    log("нампад: темп недоступен — у части нет id")
+                    continue
+                cur = _speed.get(pid, 1.0)
+                new = speed_step(cur, key)
+                if new == cur:
+                    log(f"нампад: темп {cur} — {'уже норма' if key == 'reset' else 'край шкалы'}")
+                    continue
+                if new == 1.0:
+                    _speed.pop(pid, None)
+                else:
+                    _speed[pid] = new
+                log(f"нампад: {dict(faster='«+»', slower='«−»', reset='«*»')[key]} — темп предложения {pid}: {cur} → {new}")
+                try:
+                    if new == playing:
+                        waiting = False
+                        player.paused = _paused[0]
+                    elif new == 1.0:                  # сброс — исходный WAV, запроса не нужно
+                        swap(item[1], 1.0)
+                    elif (pid, new) in _variants:     # уже делали — кэш
+                        swap(_variants[(pid, new)], new)
+                    else:                             # новая генерация; пока — тишина
+                        waiting = True
+                        player.paused = True
+                        _fetch_start(pid, new)
+                except Exception as e:
+                    log(f"смена темпа: плеер не открылся ({e!r})")
+                continue
+            if key in ("prev", "next") and _paused[0]:   # переход снимает паузу
+                _paused[0] = False
+                player.paused = waiting
+            if key == "prev":                  # ждём второе нажатие Enter до 0,35 с — двойное = эта часть заново
+                t_end = time.time() + 0.35
+                while time.time() < t_end and _nav[0] != "prev":
+                    time.sleep(0.02)
+                if _nav[0] == "prev":
+                    _nav[0] = None
+                    player.seek(0)
+                    log("нампад: двойной Enter — часть заново")
+                else:
+                    log("нампад: Enter — к предыдущей части")
+                    res = "prev"
+                    break
+            elif key == "next":
+                log("нампад: «.» — к следующей части")
+                res = "skip"
+                break
+            time.sleep(0.03)
+    finally:
+        player.close()
+        if res == "stop":
+            _np_off()
+        else:
+            _np_off_soon()
+    return res
+
+
+def _play_part_sd(player, marks, gen, start):
+    _playing[0] = True
+    _skip[0] = _back[0] = _skipmsg[0] = False
+    _nav[0] = None
+    if start == "last":
+        player.seek(marks[-1])
+    _np_on()
+    res = "done"
+    try:
+        while not player.finished():
+            if gen != _reply_gen[0]:
+                return "stop"
+            if _back[0]:
+                _back[0] = False
+                res = "back"
+                break
+            if _skip[0]:
+                _skip[0] = False
+                res = "skip"
+                break
+            key, _nav[0] = _nav[0], None
+            if key == "prev":                  # 16.10: ждём второе нажатие Enter до 0,35 с — двойное = «заново»
+                t_end = time.time() + 0.35
+                while time.time() < t_end and _nav[0] != "prev":
+                    time.sleep(0.02)
+                if _nav[0] == "prev":
+                    _nav[0] = None
+                    key = "again"
+            if key:
+                kind, sec = nav_target(marks, player.now(), key)
+                if kind == "seek":
+                    player.seek(sec)
+                    log(f"нампад: {dict(prev='назад', next='вперёд', again='заново').get(key, key)} — к {sec:.1f} с")
+                elif kind == "prevpart":
+                    log("нампад: назад — к предыдущей части")
+                    res = "prev"
+                    break
+                else:
+                    log("нампад: вперёд — к следующей части")
+                    res = "skip"
+                    break
+            time.sleep(0.03)
+    finally:
+        player.close()
+        _np_off()
+    if res == "done":
+        time.sleep(0.5)
+    _playing[0] = False
+    return res
+
+
+def _play_part_ws(item, gen):
     """Сыграть одну часть ответа. Возвращает 'done' (дочитана), 'skip' (правый Alt), 'back' (двойной правый Alt)
     или 'stop' (ответ оборван правым Ctrl либо начат новый)."""
-    label, data = item
+    label, data = item[0], item[1]
     with open(REPLY_WAV, "wb") as f:          # SND_ASYNC из памяти нельзя — через файл
         f.write(data)
     with wave.open(io.BytesIO(data)) as w:
         dur = w.getnframes() / w.getframerate()
     _playing[0] = True
-    _skip[0] = _back[0] = False
+    _skip[0] = _back[0] = _skipmsg[0] = False
     winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
     end = time.time() + dur
     res = "done"
@@ -726,18 +1314,24 @@ def replay_tail():
             log("назад — повторять нечего")
             return
         log(f"назад — непрозвучавший ответ, частей: {новых}" if новых else "назад — повтор последней части ответа")
-        pos = len(_hist) - max(1, новых)
+        _skip_key[0] = None
+        pos = _tail_pos(новых)
+        start = 0
         while 0 <= pos < len(_hist):
-            res = _play_part(_hist[pos], gen)
+            pos = _apply_skip(pos)
+            if pos >= len(_hist):
+                break
+            res = _play_part(_hist[pos], gen, start)
             if res == "stop":
                 return
-            pos = max(0, pos - 1) if res == "back" else pos + 1
+            pos, start = _step(res, pos)
     except Exception as e:
         _playing[0] = False
         log(f"не удалось повторить часть ответа: {e!r}")
     finally:
         if _live_gen[0] == gen:
             _live_gen[0] = 0
+            _playing[0] = False         # части нового формата держат _playing поднятым между предложениями — в простое опускаем
 
 
 CODE_TITLES = ("Visual Studio Code", "Studio Code Server")
@@ -789,6 +1383,12 @@ _взяты = set()           # id частей ответа, уже полож�
 _взята_ts = [0.0]        # время самой свежей взятой части
 
 
+def _item(p, data, meta):
+    """Запись истории: (seq, WAV, marks, ключ сообщения (ход, msg) или None для старого формата, номер предложения, id части)."""
+    key = (meta.get("turn"), p["msg"]) if p.get("msg") is not None else None
+    return (p.get("seq", 1), data, p.get("marks"), key, p.get("sent"), p.get("id"))
+
+
 def добрать_свежее():
     """Положить в историю части ленты, которые ещё не звучали. Возвращает, сколько добавлено.
 
@@ -811,7 +1411,7 @@ def добрать_свежее():
             log(f"не удалось получить часть ответа: {e!r}")
             continue
         _взяты.add(p.get("id")); _взята_ts[0] = p.get("ts", 0)
-        _hist.append((p.get("seq", 1), data))
+        _hist.append(_item(p, data, meta))
         del _hist[:-HIST_MAX]
         n += 1
     return n
@@ -842,6 +1442,9 @@ def speak_reply(sent, t_sent, фразы=None):
     # какая часть из _hist играет следующей; pos == len(_hist) — ждём новую. История общая для всех ответов (03.10):
     # «назад» уходит и в прошлые ответы, а новые части текущего не перебивают — ждут в очереди, пока до них дойдёт очередь.
     pos = len(_hist)
+    start = 0
+    _skip_key[0] = None
+    poll_now = False            # только что доиграли часть — следующую (она обычно уже в ленте) берём без ожидания
     final = False
     deadline = time.time() + REPLY_WAIT_SEC
     try:
@@ -849,26 +1452,35 @@ def speak_reply(sent, t_sent, фразы=None):
             if gen != _reply_gen[0]:
                 return
             if pos < len(_hist):
+                pos2 = _apply_skip(pos)
+                if pos2 != pos:
+                    pos = pos2
+                    continue
                 try:
-                    res = _play_part(_hist[pos], gen)
+                    res = _play_part(_hist[pos], gen, start)
                 except Exception as e:
                     _playing[0] = False
                     log(f"не удалось проиграть ответ: {e!r}")
                     res = "done"
                 if res == "stop":
                     return
-                pos = max(0, pos - 1) if res == "back" else pos + 1
+                pos, start = _step(res, pos)
+                poll_now = True
                 continue
             if final:
                 return
-            for _ in range(15):                             # ждём следующую часть; двойной Alt в тишине — повтор последней
+            _playing[0] = False                             # ждём следующую часть — это уже простой
+            # ждём следующую часть; двойной Alt в тишине — повтор последней. 16.10: опрос ленты чаще (0,4 с вместо 1,5 с) и сразу
+            # после конца части — предложения идут потоком, щель между ними должна быть минимальной
+            for _ in range(0 if poll_now else 4):
                 if _back[0] or gen != _reply_gen[0]:
                     break
                 time.sleep(0.1)
+            poll_now = False
             if _back[0]:
                 _back[0] = False
                 if _hist:
-                    pos = len(_hist) - 1
+                    pos, start = (_tail_pos() if len(_hist[-1]) > 3 and _hist[-1][3] is not None else len(_hist) - 1), 0
                 continue
             try:
                 with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
@@ -887,7 +1499,7 @@ def speak_reply(sent, t_sent, фразы=None):
                         data = r.read()
                     if gen != _reply_gen[0]:
                         return
-                    _hist.append((p.get("seq", 1), data))
+                    _hist.append(_item(p, data, meta))
                     while len(_hist) > HIST_MAX:            # самую старую часть забываем, указатель сдвигаем вместе с ней
                         _hist.pop(0)
                         pos = max(0, pos - 1)
@@ -902,6 +1514,7 @@ def speak_reply(sent, t_sent, фразы=None):
     finally:
         if _live_gen[0] == gen:
             _live_gen[0] = 0
+            _playing[0] = False
     log("ответ голосом не дождалась (30 мин)")
 
 
@@ -1310,7 +1923,7 @@ def main():
 
     def alt_fire():
         alt["timer"] = None
-        skip_part()
+        prev_part()        # 16.10.2026 хозяин поменял: одиночный правый Alt — назад (к началу текущего/предыдущего сообщения)
 
     def on_event(e):
         if e.event_type == "down":
@@ -1344,7 +1957,7 @@ def main():
                     if alt["timer"] and t - alt["last"] < 0.4:        # второе нажатие — предыдущая часть
                         alt["timer"].cancel()
                         alt["timer"] = None
-                        prev_part()
+                        skip_part()   # 16.10.2026: двойной правый Alt — вперёд, к следующему сообщению
                     else:                                             # ждём, не будет ли второго нажатия
                         alt["timer"] = threading.Timer(0.4, alt_fire)
                         alt["timer"].start()
@@ -1368,7 +1981,7 @@ def main():
             v.cancelled = True
 
     keyboard.hook(on_event)
-    log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа, дважды — предыдущая; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
+    log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа, дважды — предыдущая; нампад «.» — следующая часть-предложение, Enter — предыдущая, двойной Enter — заново, Backspace — пауза, «+»/«−» — темп предложения, «*» — норма, пока звучит ответ; правый Alt — следующее сообщение; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
     keyboard.wait()
 
 
