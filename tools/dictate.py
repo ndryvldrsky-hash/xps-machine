@@ -32,7 +32,7 @@
 Выключить режим «Алёна», не трогая диктовку: создать файл no_wake рядом со скриптом (проверяется каждую секунду).
 Запуск: задача планировщика «AlenaDictate» при входе rdpuser (pythonw). Лог — dictate.log рядом.
 """
-import collections, ctypes, io, wave, datetime, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.error, urllib.request, winsound
+import collections, ctypes, hmac, io, wave, datetime, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.error, urllib.request, winsound
 from ctypes import wintypes
 
 import keyboard
@@ -644,6 +644,170 @@ def вставить(text):
     time.sleep(0.25)                       # дать окну забрать текст до возврата буфера
     if прежнее is not None and прежнее != text:
         буфер_записать(прежнее)
+
+
+# ---- 29.10.2026: диктовка в окно Moonlight ----
+# Moonlight не передаёт на хост ни Юникод-события, ни буфер обмена: Ctrl+V из вставить() уходил на Кузницу и вставлял
+# ЕЁ буфер, а не фразу. Если впереди окно потока «<хост> - Moonlight», фраза уходит приёмнику на самом хосте
+# (kuznitsa/diktovka/diktovka_priem.py, служба diktovka-priem у alena), он вставляет её в активное окно там.
+MOONLIGHT_HOSTS = {"kuznitsa": "192.168.77.62"}   # имя хоста в заголовке окна Moonlight → адрес приёмника
+MOONLIGHT_PORT = 10320
+MOONLIGHT_TOKEN_FILE = os.path.join(HERE, "kuznitsa_token")
+
+
+def moonlight_host(title):
+    """Адрес приёмника, если впереди поток Moonlight с известным хостом, иначе None."""
+    m = re.match(r"^\s*(.+?)\s+-\s+Moonlight\s*$", title or "")
+    return MOONLIGHT_HOSTS.get(m.group(1).strip().lower()) if m else None
+
+
+def отправить_на_хост(addr, text):
+    """Передать фразу приёмнику на хосте Moonlight. (True — вставлено, заголовок окна на хосте)."""
+    try:
+        with open(MOONLIGHT_TOKEN_FILE, encoding="utf-8") as f:
+            tok = f.read().strip()
+        req = urllib.request.Request(f"http://{addr}:{MOONLIGHT_PORT}/type", method="POST",
+                                     data=json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"),
+                                     headers={"Content-Type": "application/json", "X-Token": tok})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            ans = json.loads(r.read().decode("utf-8"))
+        log(f"Moonlight → {addr}: {ans.get('how')} в окно «{str(ans.get('window', ''))[:60]}»")
+        return bool(ans.get("ok")), str(ans.get("window", ""))
+    except Exception as e:
+        log(f"Moonlight → {addr}: не передано: {e!r}")
+        return False, ""
+
+
+# ---- 29.10.2026 (вечер): клавиши диктовки с хоста Moonlight ----
+# Moonlight (capturesyskeys=2) забирает клавиатуру своим хуком — правый Ctrl и прочие до keyboard.hook не доходят.
+# Решение хозяина: Moonlight шлёт клавиши на Кузницу как есть, там их ловит слушатель (kuznitsa/diktovka/diktovka_priem.py)
+# и сразу присылает сюда: POST http://<XPS>:10321/klavisha {"k": "rctrl", "t": "down"|"up", ...}, заголовок X-Token
+# (тот же kuznitsa_token). Принимаются только из 192.168.77.0/24, tailnet и localhost, и только когда впереди окно
+# Moonlight известного хоста — иначе игнор (двойных срабатываний нет). Дальше — тот же on_event, что и у своих клавиш.
+KLAV_PORT = 10321
+KLAV_SETI = ("192.168.77.0/24", "100.64.0.0/10", "127.0.0.0/8")
+KLAV_IMENA = {"rctrl": "right ctrl", "ralt": "right alt", "rshift": "right shift", "enter": "enter", "kp_enter": "enter",
+              "other": "внешняя прочая"}
+KLAV_NAMPAD = {"kp_dot": "next", "kp_enter": "prev", "kp_minus": "slower", "kp_plus": "faster", "kp_star": "reset",
+               "kp_0": "pause"}
+_vnesh = {"obrabotchik": None, "okno": "", "ignor_t": 0.0, "rec": False}
+_dedup = {}                 # (источник, имя, тип) → время: одна и та же клавиша и от своего хука, и с хоста — один раз
+_dedup_lock = threading.Lock()
+
+
+def klav_dubl(src, name, typ):
+    """True — такое же событие только что пришло из другого источника (свой хук / хост Moonlight)."""
+    if name not in ("right ctrl", "right alt", "alt gr", "right shift", "enter"):
+        return False
+    name = "right alt" if name == "alt gr" else name
+    now = time.time()
+    with _dedup_lock:
+        drugoi = _dedup.get(("host" if src == "local" else "local", name, typ), 0.0)
+        _dedup[(src, name, typ)] = now
+        if now - drugoi < 0.5:
+            _dedup[(src, name, typ)] = 0.0     # пара сработала — следующую не глушить
+            return True
+    return False
+
+
+def klav_vneshnyaya(sob):
+    """Событие клавиши с хоста Moonlight. Возвращает строку-итог для ответа и журнала."""
+    k, typ = str(sob.get("k", "")), str(sob.get("t", ""))
+    title = foreground_title()
+    if not moonlight_host(title):
+        # отпускание правого Ctrl, нажатого при окне Moonlight, всё же принимаем — иначе запись не закончится
+        if not (k == "rctrl" and typ == "up" and _vnesh["rec"]):
+            if k != "other" and time.time() - _vnesh["ignor_t"] > 30:
+                _vnesh["ignor_t"] = time.time()
+                log(f"клавиша с хоста ({k} {typ}) — впереди не Moonlight («{title[:40]}»), игнорирую")
+            return "игнор: впереди не Moonlight"
+    if k in KLAV_NAMPAD and typ == "down" and _np_state["remove"] is not None:
+        # нампад во время озвучки — как в _np_filter (на хосте клавиша при этом всё равно дойдёт до окна)
+        _nav[0] = KLAV_NAMPAD[k]
+        log(f"клавиша с хоста: {k} — {KLAV_NAMPAD[k]} (озвучка)")
+        return "нампад"
+    name = KLAV_IMENA.get(k)
+    if name is None:
+        return "не моя клавиша"
+    if klav_dubl("host", name, typ):
+        return "дубль своего хука"
+    if k in ("enter", "kp_enter"):
+        _vnesh["okno"] = str(sob.get("okno", ""))
+    import types
+    e = types.SimpleNamespace(name=name, event_type=typ, scan_code=0, is_keypad=False,
+                              shift=bool(sob.get("shift")), vnesh=True)
+    f = _vnesh["obrabotchik"]
+    if f is None:
+        return "ещё не готово"
+    f(e)
+    if k == "rctrl":
+        _vnesh["rec"] = typ == "down"
+        log(f"клавиша с хоста: правый Ctrl {'нажат — запись' if typ == 'down' else 'отпущен'}")
+    return "принято"
+
+
+def klav_server():
+    import ipaddress
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    seti = [ipaddress.ip_network(n) for n in KLAV_SETI]
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"          # keep-alive: слушатель держит одно соединение, без лишних рукопожатий
+
+        def setup(self):
+            super().setup()
+            # без Nagle: ответ уходит двумя кусками (заголовки, тело), и второй ждал подтверждения ~40 мс — следующая
+            # клавиша в очереди Кузницы опаздывала на столько же (замер 29.10: 50 мс вместо 4)
+            try:
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+
+        def _otvet(self, code, obj):
+            b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(min(n, 10000)) if n else b""
+            try:
+                ip_ok = any(ipaddress.ip_address(self.client_address[0]) in s for s in seti)
+            except ValueError:
+                ip_ok = False
+            if self.path != "/klavisha" or not ip_ok:
+                return self._otvet(404, {"ok": False})
+            try:
+                with open(MOONLIGHT_TOKEN_FILE, encoding="utf-8") as f:
+                    tok = f.read().strip()
+            except Exception:
+                tok = ""
+            if not tok or not hmac.compare_digest(self.headers.get("X-Token", ""), tok):
+                log(f"клавиша с хоста: чужой токен с {self.client_address[0]}")
+                return self._otvet(403, {"ok": False})
+            t0 = time.time()
+            try:
+                itog = klav_vneshnyaya(json.loads(body.decode("utf-8")))
+            except Exception as e:
+                log(f"клавиша с хоста: ошибка {e!r}")
+                return self._otvet(500, {"ok": False})
+            self._otvet(200, {"ok": True, "itog": itog, "ms": round((time.time() - t0) * 1000, 1)})
+
+        def log_message(self, *a):
+            pass
+
+    while True:
+        try:
+            srv = ThreadingHTTPServer(("0.0.0.0", KLAV_PORT), H)
+            srv.daemon_threads = True
+            log(f"клавиши с хоста Moonlight: слушаю :{KLAV_PORT}")
+            srv.serve_forever()
+        except Exception as e:
+            log(f"клавиши с хоста: сервер упал {e!r} — снова через 10 с")
+        time.sleep(10)
 
 
 def foreground_title() -> str:
@@ -1355,6 +1519,8 @@ def on_enter():
         log(f"Enter после диктовки — не жду ответ: с последней фразы прошло {time.time() - t:.0f} с (предел {ARM_SEC})")
         return
     title = foreground_title()
+    if moonlight_host(title) and _vnesh["okno"]:
+        title = _vnesh["okno"]          # 29.10.2026: Enter пришёл с хоста Moonlight — решает окно там
     if not is_code_window(title):
         log(f"Enter после диктовки — не жду ответ: впереди окно «{title[:60]}», не чат")
         return
@@ -1869,6 +2035,19 @@ class Voice:
             log(f"{'Алёна' if wake else 'клавиша'}: {dur:.1f} с → {took:.1f} с, окно «{title[:60]}»{' +Enter' if send else ''}: {text}")
             if not text:
                 return
+            ml = moonlight_host(title)
+            if ml:
+                # 29.10.2026: поток Moonlight — фразу вставляет приёмник на хосте; при сбое фраза остаётся
+                # в буфере XPS (вставить потом руками в другом окне) и звучит сигнал ошибки
+                ok, okno_hosta = отправить_на_хост(ml, text + " ")
+                if not ok:
+                    буфер_записать(text)
+                    beep((300, 300))
+                elif is_code_window(okno_hosta):
+                    # 29.10.2026 (вечер): на хосте впереди чат Code — ждём ручной Enter (он придёт с хоста) и озвучим ответ
+                    _armed["все"].append(text)
+                    _armed.update(text=_armed["text"] or text, t=time.time())
+                return
             вставить(text if send else text + " ")
             if send:
                 time.sleep(0.15)
@@ -1966,7 +2145,7 @@ def main():
             return
         if e.event_type == "down" and alt["down"]:
             alt["other"] = True
-        if e.event_type == "down" and e.name == "enter" and not keyboard.is_pressed("shift"):   # Shift+Enter в чате — перенос строки
+        if e.event_type == "down" and e.name == "enter" and not getattr(e, "shift", False) and not keyboard.is_pressed("shift"):   # Shift+Enter в чате — перенос строки
             if v.busy:
                 _enter_рано[0] = time.time()     # вставка ещё идёт — отработаем в конце _deliver2
             elif _armed["text"]:
@@ -1980,7 +2159,21 @@ def main():
         elif e.event_type == "down" and v.rec:
             v.cancelled = True
 
-    keyboard.hook(on_event)
+    zamok = threading.Lock()     # свой хук и клавиши с хоста Moonlight приходят из разных потоков
+
+    def on_local(e):
+        if klav_dubl("local", getattr(e, "name", None), e.event_type):
+            return
+        with zamok:
+            on_event(e)
+
+    def on_host(e):
+        with zamok:
+            on_event(e)
+
+    _vnesh["obrabotchik"] = on_host
+    threading.Thread(target=klav_server, daemon=True).start()
+    keyboard.hook(on_local)
     log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа, дважды — предыдущая; нампад «.» — следующая часть-предложение, Enter — предыдущая, двойной Enter — заново, Backspace — пауза, «+»/«−» — темп предложения, «*» — норма, пока звучит ответ; правый Alt — следующее сообщение; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
     keyboard.wait()
 
