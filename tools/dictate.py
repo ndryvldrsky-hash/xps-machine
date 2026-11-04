@@ -2148,9 +2148,15 @@ def main():
 
     def alt_fire():
         alt["timer"] = None
-        prev_part()        # 16.10.2026 хозяин поменял: одиночный правый Alt — назад (к началу текущего/предыдущего сообщения)
+        log(f"правый Alt одиночный → назад (цикл={'да' if _live_gen[0] else 'нет'}, играет={'да' if _playing[0] else 'нет'}, частей в истории {len(_hist)})")
+        prev_part()      # 16.10.2026 хозяин поменял: одиночный правый Alt — назад (к началу текущего/предыдущего сообщения)
 
     def on_event(e):
+        # 04.11.2026 (хозяин: «Alt не работает»): на раскладке, где правый Alt — AltGr, Windows шлёт его как «фальшивый Ctrl»
+        # (скан-код 541, vk 162), а библиотека keyboard при ОТПУСКАНИИ называет это событие 'ctrl' (при нажатии — 'alt gr').
+        # Отпускание не совпадало с SKIP_KEYS, Alt залипал «нажатым» и ни одно нажатие не срабатывало. Приводим к 'right alt'.
+        if getattr(e, "scan_code", None) == 541 and e.name in ("ctrl", "alt gr"):
+            e.name = "right alt"
         if e.event_type == "down":
             v.last_key = time.time()
         if e.name == "right shift":
@@ -2172,16 +2178,24 @@ def main():
             return
         if e.event_type == "down" and rsh["down"]:
             rsh["other"] = True                                      # Shift+буква — обычный ввод, не команда
+        if e.name not in SKIP_KEYS and ("alt" in str(e.name).lower() or getattr(e, "scan_code", None) in (56, 541)):
+            log(f"Alt под другим именем: {e.event_type} имя={e.name!r} скан={getattr(e, 'scan_code', None)}")
         if e.name in SKIP_KEYS:
+            # 04.11.2026 (хозяин: «Alt не работает»): строка на каждое событие правого Alt — для разбора, доходит ли оно до хука
+            log(f"правый Alt: {e.event_type} имя={e.name!r} скан={getattr(e, 'scan_code', None)} "
+                f"(зажат={alt['down']}, чужая={alt['other']}, цикл={'да' if _live_gen[0] else 'нет'}, играет={'да' if _playing[0] else 'нет'})")
             if e.event_type == "down":
+                if alt["down"] and time.time() - alt.get("t", 0) > 3:   # событие отпускания потерялось — не залипать
+                    alt["down"] = False
                 if not alt["down"]:
-                    alt.update(down=True, other=False)
+                    alt.update(down=True, other=False, t=time.time())
             else:
                 if alt["down"] and not alt["other"]:
                     t = time.time()
                     if alt["timer"] and t - alt["last"] < 0.4:        # второе нажатие — предыдущая часть
                         alt["timer"].cancel()
                         alt["timer"] = None
+                        log("правый Alt двойной → вперёд")
                         skip_part()   # 16.10.2026: двойной правый Alt — вперёд, к следующему сообщению
                     else:                                             # ждём, не будет ли второго нажатия
                         alt["timer"] = threading.Timer(0.4, alt_fire)
