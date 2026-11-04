@@ -1090,6 +1090,10 @@ def _step(res, pos):
     if key is not None and res == "back":
         first = _msg_start(pos)
         elapsed = time.time() - _cur_msg[1] if _cur_msg[0] == key else 999
+        if first == 0 and elapsed <= MSG_BACK_SEC:
+            log("назад: это самое раннее сообщение истории")
+            beep((300, 120), (300, 120))                # раньше некуда — писк вместо повтора того же сообщения
+            return pos, 0
         if elapsed > MSG_BACK_SEC or first == 0:
             return _enter_msg(first), 0                 # к началу текущего сообщения
         return _enter_msg(_msg_start(first - 1)), 0     # к началу предыдущего
@@ -1549,6 +1553,68 @@ _взяты = set()           # id частей ответа, уже полож�
 _взята_ts = [0.0]        # время самой свежей взятой части
 
 
+# ---- 04.11.2026 (хозяин: «Alt возвращает всё к тому же сообщению» — после перезапуска клиента история пустая): история частей
+# хранится на диске W:\Tools\dictate\история\ (<id>.wav + индекс.json, последние HIST_MAX частей) и подгружается при старте.
+# Это кэш: WAV, выпавшие из индекса, стираются ротацией.
+HIST_DIR = os.path.join(HERE, "история")
+_hist_ts = {}              # id части → время её публикации в ленте
+_hist_lock = threading.Lock()
+
+
+def _hist_persist(p, data):
+    """Записать часть на диск и обновить индекс (по _hist, последние HIST_MAX)."""
+    try:
+        with _hist_lock:
+            os.makedirs(HIST_DIR, exist_ok=True)
+            pid = p.get("id")
+            _hist_ts[pid] = p.get("ts", 0)
+            fn = os.path.join(HIST_DIR, f"{pid}.wav")
+            if pid and not os.path.exists(fn):
+                with open(fn + ".tmp", "wb") as f:
+                    f.write(data)
+                os.replace(fn + ".tmp", fn)
+            idx = [[it[0], it[5], it[2], list(it[3]) if it[3] else None, it[4], _hist_ts.get(it[5], 0)] for it in _hist if len(it) > 5 and it[5]]
+            with open(os.path.join(HIST_DIR, "индекс.json.tmp"), "w", encoding="utf-8") as f:
+                json.dump(idx[-HIST_MAX:], f, ensure_ascii=False)
+            os.replace(os.path.join(HIST_DIR, "индекс.json.tmp"), os.path.join(HIST_DIR, "индекс.json"))
+            keep = {f"{i[1]}.wav" for i in idx[-HIST_MAX:]}
+            for name in os.listdir(HIST_DIR):
+                if name.endswith(".wav") and name not in keep:
+                    try:
+                        os.remove(os.path.join(HIST_DIR, name))
+                    except OSError:
+                        pass
+    except Exception as e:
+        log(f"история не сохранена на диск: {e!r}")
+
+
+def _hist_load():
+    """При старте: прочитать историю с диска; взятые части и время последней — чтобы лента не добавила их второй раз."""
+    try:
+        with open(os.path.join(HIST_DIR, "индекс.json"), encoding="utf-8") as f:
+            idx = json.load(f)
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        log(f"индекс истории не прочитан: {e!r}")
+        return 0
+    n = 0
+    for seq, pid, marks, key, sent, ts in idx:
+        try:
+            with open(os.path.join(HIST_DIR, f"{pid}.wav"), "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        _hist.append((seq, data, marks, tuple(key) if key else None, sent, pid))
+        _hist_ts[pid] = ts
+        _взяты.add(pid)
+        _взята_ts[0] = max(_взята_ts[0], ts)
+        n += 1
+    del _hist[:-HIST_MAX]
+    log(f"история с диска: {n} частей")
+    return n
+
+
 def _item(p, data, meta):
     """Запись истории: (seq, WAV, marks, ключ сообщения (ход, msg) или None для старого формата, номер предложения, id части)."""
     key = (meta.get("turn"), p["msg"]) if p.get("msg") is not None else None
@@ -1579,6 +1645,7 @@ def добрать_свежее():
         _взяты.add(p.get("id")); _взята_ts[0] = p.get("ts", 0)
         _hist.append(_item(p, data, meta))
         del _hist[:-HIST_MAX]
+        _hist_persist(p, data)
         n += 1
     return n
 
@@ -1711,6 +1778,7 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
                     if gen != _reply_gen[0]:
                         return
                     _hist.append(_item(p, data, meta))
+                    _hist_persist(p, data)
                     while len(_hist) > HIST_MAX:            # самую старую часть забываем, указатель сдвигаем вместе с ней
                         _hist.pop(0)
                         pos = max(0, pos - 1)
@@ -2137,6 +2205,13 @@ def voice_hotkey(action):
 
 def main():
     v = Voice()
+    _hist_load()
+    try:
+        новых = добрать_свежее()       # лента могла уйти вперёд, пока клиент не работал
+        if новых:
+            log(f"при старте добрано из ленты: {новых} частей")
+    except Exception as e:
+        log(f"добор из ленты при старте: {e!r}")
 
     # правый Alt считается, только если нажат один, без других клавиш; двойное нажатие за 0,4 с — «назад» (03.10)
     alt = {"down": False, "other": False, "last": 0.0, "timer": None}
