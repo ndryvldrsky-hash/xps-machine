@@ -1621,6 +1621,13 @@ def _item(p, data, meta):
     return (p.get("seq", 1), data, p.get("marks"), key, p.get("sent"), p.get("id"))
 
 
+def _ходы(meta):
+    """Ходы ленты по порядку: turns (очередь последних ходов); лента старого формата — один ход."""
+    if meta.get("turns"):
+        return meta["turns"]
+    return [meta] if meta.get("turn") or meta.get("parts") else []
+
+
 def добрать_свежее():
     """Положить в историю части ленты, которые ещё не звучали. Возвращает, сколько добавлено.
 
@@ -1633,20 +1640,22 @@ def добрать_свежее():
         log(f"лента ответа не прочитана: {e!r}")
         return 0
     n = 0
-    for p in meta.get("parts") or [dict(meta, final=True)]:
-        if p.get("id") in _взяты or p.get("ts", 0) <= _взята_ts[0]:
-            continue
-        try:
-            with urllib.request.urlopen(REPLY_URL + p["wav"], timeout=10) as r:
-                data = r.read()
-        except Exception as e:
-            log(f"не удалось получить часть ответа: {e!r}")
-            continue
-        _взяты.add(p.get("id")); _взята_ts[0] = p.get("ts", 0)
-        _hist.append(_item(p, data, meta))
-        del _hist[:-HIST_MAX]
-        _hist_persist(p, data)
-        n += 1
+    # 04.11.2026: лента — очередь ходов; в историю идёт всё, чего там ещё нет (старое поле parts — копия последнего хода)
+    for t in _ходы(meta):
+        for p in t.get("parts") or []:
+            if p.get("id") in _взяты:
+                continue
+            try:
+                with urllib.request.urlopen(REPLY_URL + p["wav"], timeout=10) as r:
+                    data = r.read()
+            except Exception as e:
+                log(f"не удалось получить часть ответа: {e!r}")
+                continue
+            _взяты.add(p.get("id")); _взята_ts[0] = max(_взята_ts[0], p.get("ts", 0))
+            _hist.append(_item(p, data, t))
+            del _hist[:-HIST_MAX]
+            _hist_persist(p, data)
+            n += 1
     return n
 
 
@@ -1667,23 +1676,35 @@ def bg_loop():
                 meta = json.loads(r.read().decode("utf-8"))
         except Exception:
             continue
-        turn = meta.get("turn")
+        ходы = _ходы(meta)
         if first:                          # то, что лежало в ленте до запуска клиента, не играем
             first = False
-            if turn:
-                _bg_done.add(turn)
+            for t in ходы:
+                if t.get("turn"):
+                    _bg_done.add(t["turn"])
             continue
-        if not meta.get("bg") or not turn or turn in _bg_done or _live_gen[0]:
+        if _live_gen[0]:
             continue
-        parts = [p for p in meta.get("parts") or [] if p.get("id") not in _взяты]
-        if not parts or max(p.get("ts", 0) for p in parts) < time.time() - BG_FRESH_SEC:
+        выбран = None
+        for t in ходы:                     # очередь: самый ранний непроигранный ход «фон/печать» со свежими частями
+            parts = [p for p in t.get("parts") or [] if p.get("id") not in _взяты]
+            if (t.get("bg") and t.get("turn") and t["turn"] not in _bg_done and parts
+                    and max(p.get("ts", 0) for p in parts) >= time.time() - BG_FRESH_SEC):
+                выбран = (t, parts)
+                break
+        if выбран is None:
+            try:                           # играть нечего — всё пришедшее в историю (для Alt) и на диск
+                добрать_свежее()
+            except Exception as e:
+                log(f"добор в историю: {e!r}")
             continue
-        log(f"ход от уведомления в голосовой сессии: играю ответ ({len(parts)} ч.): {meta.get('for', '')[:60]!r}")
+        t, parts = выбран
+        log(f"ход от уведомления/печати: играю ответ ({len(parts)} ч.): {t.get('for', '')[:60]!r}")
         try:
-            speak_reply("", 0, bg_turn=turn)
+            speak_reply("", 0, bg_turn=t["turn"])
         except Exception as e:
             log(f"ответ на уведомление не проигран: {e!r}")
-        _bg_done.add(turn)
+        _bg_done.add(t["turn"])
 
 
 def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
@@ -1760,13 +1781,17 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
                     meta = json.loads(r.read().decode("utf-8"))
             except Exception:
                 continue
+            ходы = _ходы(meta)
             if bg_turn:
-                if meta.get("turn") != bg_turn:
-                    if meta.get("parts"):
-                        return           # лента ушла к другому ходу — этот ход закончен/заменён, сторож возьмёт новый
+                meta = next((t for t in ходы if t.get("turn") == bg_turn), None)
+                if meta is None:
+                    if len(ходы) >= 5:
+                        return           # ход вытеснен из очереди ленты — дальше его не ждать
                     continue
-            elif not any(k in norm(meta.get("for", "")) for k in keys):
-                continue
+            else:
+                meta = next((t for t in reversed(ходы) if any(k in norm(t.get("for", "")) for k in keys)), None)
+                if meta is None:
+                    continue
             parts = meta.get("parts") or [dict(meta, final=True)]     # старый формат — одна часть
             for p in parts:
                 if p.get("id") in seen or p.get("id") in _взяты or p.get("ts", 0) < t_sent - 2:
