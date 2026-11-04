@@ -1583,14 +1583,51 @@ def добрать_свежее():
     return n
 
 
-def speak_reply(sent, t_sent, фразы=None):
+_bg_done = set()         # ходы от уведомлений (bg в ленте), которые уже проиграны, оборваны стопом или заменены другими
+BG_FRESH_SEC = 900       # часть старше — не играем (после перезапуска/простоя старое не озвучивается)
+
+
+def bg_loop():
+    """04.11.2026 (хозяин: «ответы после ответов помощниц молчат — можно их тоже говорить?»): ход, начатый не хозяином
+    (<task-notification> и т.п.) в голосовой сессии, voice_reply.py помечает в ленте bg=True. Его мои ответы играются так же,
+    как ответ на фразу, но в очередь: пока звучит или ждёт частей ответ на фразу хозяина (_live_gen), не трогаем. Правый Ctrl
+    во время звучания обрывает и остальной ход (он попадает в _bg_done и повторно не играется)."""
+    first = True
+    while True:
+        time.sleep(1.5)
+        try:
+            with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
+                meta = json.loads(r.read().decode("utf-8"))
+        except Exception:
+            continue
+        turn = meta.get("turn")
+        if first:                          # то, что лежало в ленте до запуска клиента, не играем
+            first = False
+            if turn:
+                _bg_done.add(turn)
+            continue
+        if not meta.get("bg") or not turn or turn in _bg_done or _live_gen[0]:
+            continue
+        parts = [p for p in meta.get("parts") or [] if p.get("id") not in _взяты]
+        if not parts or max(p.get("ts", 0) for p in parts) < time.time() - BG_FRESH_SEC:
+            continue
+        log(f"ход от уведомления в голосовой сессии: играю ответ ({len(parts)} ч.): {meta.get('for', '')[:60]!r}")
+        try:
+            speak_reply("", 0, bg_turn=turn)
+        except Exception as e:
+            log(f"ответ на уведомление не проигран: {e!r}")
+        _bg_done.add(turn)
+
+
+def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
     """Ждать озвученный ответ Алёны на отправленную голосом фразу и проигрывать его по частям.
 
     Ответ готовит voice_reply.py в аддоне Студии (Штаб): /local/voice_reply/voice_reply.json — лента хода
     {turn, for, parts: [{id, seq, text, wav, ts, final}]} + WAV каждой части (голос Gemini, запасной Piper). С 28.09.2026 озвучиваются и
     промежуточные сообщения хода: части играются по порядку, одна за другой, до части с final. Сопоставление —
     по началу отправленного текста в поле `for`."""
-    mark_voice(sent)
+    if not bg_turn:
+        mark_voice(sent)
     # 12.10.2026: сообщение диктуется несколькими фразами, которые хозяин потом переставляет и правит («Ой.» стёр, начало
     # заменил) — ключ по одной первой фразе с итоговым текстом не совпадал, и ответ молчал. Теперь годится любая из фраз.
     keys = [k for k in {norm(x)[:40] for x in ([sent] + list(фразы or []))} if len(k) >= 8] or [norm(sent)[:40]]
@@ -1598,9 +1635,12 @@ def speak_reply(sent, t_sent, фразы=None):
     # как ответ на ПЕРВОЕ сообщение хода. Новое ожидание отменяло прежнее и ждало только свой ключ: ответ на «Проверь линии…»
     # не прозвучал, потому что следом были отправлены «Напомню…» и «Напомни.». Теперь ключи копятся, пока ответ не дочитан
     # до финала: годится ответ на любое из неотвеченных сообщений.
-    _ожидают[:] = [(k, t) for k, t in _ожидают if time.time() - t < REPLY_WAIT_SEC] + [(k, t_sent) for k in keys]
-    keys = [k for k, _ in _ожидают]
-    t_sent = min(t for _, t in _ожидают)
+    if bg_turn:                  # ход от уведомления: ожидания хозяйских фраз не трогаем, ключей нет — сопоставление по номеру хода
+        keys, t_sent = [], 0
+    else:
+        _ожидают[:] = [(k, t) for k, t in _ожидают if time.time() - t < REPLY_WAIT_SEC] + [(k, t_sent) for k in keys]
+        keys = [k for k, _ in _ожидают]
+        t_sent = min(t for _, t in _ожидают)
     _reply_gen[0] += 1
     gen = _reply_gen[0]
     _live_gen[0] = gen
@@ -1653,7 +1693,12 @@ def speak_reply(sent, t_sent, фразы=None):
                     meta = json.loads(r.read().decode("utf-8"))
             except Exception:
                 continue
-            if not any(k in norm(meta.get("for", "")) for k in keys):
+            if bg_turn:
+                if meta.get("turn") != bg_turn:
+                    if meta.get("parts"):
+                        return           # лента ушла к другому ходу — этот ход закончен/заменён, сторож возьмёт новый
+                    continue
+            elif not any(k in norm(meta.get("for", "")) for k in keys):
                 continue
             parts = meta.get("parts") or [dict(meta, final=True)]     # старый формат — одна часть
             for p in parts:
@@ -1675,7 +1720,8 @@ def speak_reply(sent, t_sent, фразы=None):
                     log(f"не удалось получить часть ответа: {e!r}")
                 if p.get("final"):
                     final = True
-                    _ожидают.clear()        # ход закрыт — прежние ключи больше не ждут
+                    if not bg_turn:
+                        _ожидают.clear()        # ход закрыт — прежние ключи больше не ждут
                     break
     finally:
         if _live_gen[0] == gen:
@@ -2173,6 +2219,7 @@ def main():
 
     _vnesh["obrabotchik"] = on_host
     threading.Thread(target=klav_server, daemon=True).start()
+    threading.Thread(target=bg_loop, daemon=True).start()
     keyboard.hook(on_local)
     log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — следующая часть ответа, дважды — предыдущая; нампад «.» — следующая часть-предложение, Enter — предыдущая, двойной Enter — заново, Backspace — пауза, «+»/«−» — темп предложения, «*» — норма, пока звучит ответ; правый Alt — следующее сообщение; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
     keyboard.wait()
