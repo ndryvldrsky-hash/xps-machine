@@ -1086,6 +1086,8 @@ def _step(res, pos):
         while j < len(_hist) and len(_hist[j]) > 3 and _hist[j][3] == key:
             j += 1
         _skip_key[0] = key if j >= len(_hist) else None
+        if j >= len(_hist) and len(_hist[pos]) > 5:
+            _report_pos(_hist[pos][5], "skp")     # следующее сообщение ещё не опубликовано: остаток этого — позади места
         return _enter_msg(j), 0
     if key is not None and res == "back":
         first = _msg_start(pos)
@@ -1214,6 +1216,7 @@ def _fetch_variant(pid, k):
             req = urllib.request.Request(f"http://{HOST}:8123/api/webhook/{SPEED_HOOK}", method="POST",
                                          data=json.dumps({"id": pid, "k": k, "n": nonce}).encode("utf-8"),
                                          headers={"Content-Type": "application/json"})
+            _speed_hook_t[0] = time.time()
             urllib.request.urlopen(req, timeout=5).read()
             t0 = time.time()
             while data is None and time.time() - t0 < VAR_WAIT_SEC:
@@ -1281,6 +1284,9 @@ def _play_part_msg(item, gen):
     _skip[0] = _back[0] = _skipmsg[0] = False
     _nav[0] = None
     _np_on()
+    # серверу: «играю вот это» — он готовит ближайшие к этому месту предложения первыми; с 04.11 это «часы» (_report_clock): те же
+    # сведения о месте плюс момент нулевой секунды WAV — по ним страница чата подсвечивает звучащее предложение и слова (караоке)
+    clk_sig = [None]
     res = "done"
 
     def swap(new_data, new_k):
@@ -1294,6 +1300,9 @@ def _play_part_msg(item, gen):
 
     try:
         while not player.finished():
+            if clk_sig[0] != (id(player), player.paused):     # старт, пауза/продолжение, смена WAV (темп) — сообщить часы
+                clk_sig[0] = (id(player), player.paused)
+                _report_clock(pid, player)
             if gen != _reply_gen[0]:
                 res = "stop"
                 break
@@ -1370,6 +1379,7 @@ def _play_part_msg(item, gen):
                 if _nav[0] == "prev":
                     _nav[0] = None
                     player.seek(0)
+                    _report_clock(pid, player)
                     log("нампад: двойной Enter — часть заново")
                 else:
                     log("нампад: Enter — к предыдущей части")
@@ -1382,6 +1392,8 @@ def _play_part_msg(item, gen):
             time.sleep(0.03)
     finally:
         player.close()
+        if res != "done":                      # оборвано/перескочили — подсветку снять (следующая часть пришлёт свои часы)
+            _report_clock(pid, None)
         if res == "stop":
             _np_off()
         else:
@@ -1573,7 +1585,8 @@ def _hist_persist(p, data):
                 with open(fn + ".tmp", "wb") as f:
                     f.write(data)
                 os.replace(fn + ".tmp", fn)
-            idx = [[it[0], it[5], it[2], list(it[3]) if it[3] else None, it[4], _hist_ts.get(it[5], 0)] for it in _hist if len(it) > 5 and it[5]]
+            idx = [[it[0], it[5], it[2], list(it[3]) if it[3] else None, it[4], _hist_ts.get(it[5], 0), it[6] if len(it) > 6 else None]
+                   for it in _hist if len(it) > 5 and it[5]]
             with open(os.path.join(HIST_DIR, "индекс.json.tmp"), "w", encoding="utf-8") as f:
                 json.dump(idx[-HIST_MAX:], f, ensure_ascii=False)
             os.replace(os.path.join(HIST_DIR, "индекс.json.tmp"), os.path.join(HIST_DIR, "индекс.json"))
@@ -1599,13 +1612,15 @@ def _hist_load():
         log(f"индекс истории не прочитан: {e!r}")
         return 0
     n = 0
-    for seq, pid, marks, key, sent, ts in idx:
+    for row in idx:
+        seq, pid, marks, key, sent, ts = row[:6]
+        ord_ = row[6] if len(row) > 6 else None
         try:
             with open(os.path.join(HIST_DIR, f"{pid}.wav"), "rb") as f:
                 data = f.read()
         except OSError:
             continue
-        _hist.append((seq, data, marks, tuple(key) if key else None, sent, pid))
+        _hist.append((seq, data, marks, tuple(key) if key else None, sent, pid, ord_))
         _hist_ts[pid] = ts
         _взяты.add(pid)
         _взята_ts[0] = max(_взята_ts[0], ts)
@@ -1618,7 +1633,7 @@ def _hist_load():
 def _item(p, data, meta):
     """Запись истории: (seq, WAV, marks, ключ сообщения (ход, msg) или None для старого формата, номер предложения, id части)."""
     key = (meta.get("turn"), p["msg"]) if p.get("msg") is not None else None
-    return (p.get("seq", 1), data, p.get("marks"), key, p.get("sent"), p.get("id"))
+    return (p.get("seq", 1), data, p.get("marks"), key, p.get("sent"), p.get("id"), p.get("ord"))
 
 
 def _ходы(meta):
@@ -1626,6 +1641,92 @@ def _ходы(meta):
     if meta.get("turns"):
         return meta["turns"]
     return [meta] if meta.get("turn") or meta.get("parts") else []
+
+
+# ---- 04.11.2026 (хозяин: «приоритет подготовки файлов озвучки — вокруг того места, которое сейчас играет, вперёд и назад») ----
+# Сервер (voice_reply.py) готовит предложения в порядке близости к играющему месту и публикует их в ленту не обязательно по порядку.
+# У каждой части в ленте есть ord — сквозной номер предложения; история _hist держится отсортированной по ord (опоздавшая часть
+# «позади» вставляется на своё место), а поле ленты pending — номера ещё не готовых: плеер не перескакивает через дыру, которую ждёт.
+# Место плеер сообщает серверу вебхуком alena_golos_skorost (тот же канал, что у темпа; отдельного вебхука в HA нет):
+# {id части, k: "pos" — «играю эту часть» | "skp" — «пропустил остаток её сообщения, дальше — следующее»}.
+_pending = []              # ord ещё не опубликованных предложений (из последнего прочитанного кадра ленты)
+GAP_WAIT_SEC = 25          # дольше дыру не ждём — играем дальше
+POS_DEBOUNCE_SEC = 0.3     # залп нажатий Alt — серверу уходит только последнее место
+POS_DEBOUNCE_CLK = 0.08    # «часы» подсветки — почти сразу (тут же склеиваются «стоп» + «играет следующая»)
+_pos_slot = [None]
+_pos_ev = threading.Event()
+_speed_hook_t = [0.0]      # когда последний раз уходил запрос темпа в тот же input_text — позицию после него шлём с задержкой
+
+
+def _hist_insert(item):
+    """Положить часть в историю по её ord (нет ord — в конец). Возвращает индекс, на который она встала."""
+    o = item[6] if len(item) > 6 else None
+    j = len(_hist)
+    if o is not None:
+        while j > 0 and len(_hist[j - 1]) > 6 and _hist[j - 1][6] is not None and _hist[j - 1][6] > o:
+            j -= 1
+    _hist.insert(j, item)
+    return j
+
+
+def _ждём_дыру(gap_from, pos):
+    """Между только что доигранной частью (её ord — gap_from) и _hist[pos] есть ещё не готовое предложение?"""
+    if gap_from is None or not (0 <= pos < len(_hist)) or len(_hist[pos]) <= 6 or _hist[pos][6] is None:
+        return False
+    x = _hist[pos][6]
+    return any(gap_from < o < x for o in _pending)
+
+
+def _ord_части(pos):
+    it = _hist[pos] if 0 <= pos < len(_hist) else None
+    return it[6] if it is not None and len(it) > 6 else None
+
+
+def _report_pos(pid, kind, n=None):
+    """Сообщить серверу играющее место (асинхронно, последнее побеждает). n — своя «соль» (у «часов» там флаг и время)."""
+    if not pid:
+        return
+    _pos_slot[0] = (pid, kind, n)
+    _pos_ev.set()
+
+
+def _report_clock(pid, player):
+    """«Часы» части для подсветки в чате (04.11.2026, «караоке»): флаг r — играет, число = момент нулевой секунды WAV на часах XPS
+    (мс с эпохи; учтена задержка устройства вывода), p — пауза, число = позиция в WAV (мс), s — ничего не играет (player=None).
+    Страница чата — в браузере на этой же машине, поэтому часы у неё те же."""
+    if not pid:
+        return
+    if player is None:
+        _report_pos(pid, "clk", "s0")
+        return
+    t = player.pos / player.rate - player.lat           # слышимая позиция: колбэк впереди устройства на его задержку
+    if player.paused:
+        _report_pos(pid, "clk", "p%d" % max(0, int(t * 1000)))
+    else:
+        _report_pos(pid, "clk", "r%d" % int((time.time() - t) * 1000))
+
+
+def _pos_sender():
+    while True:
+        _pos_ev.wait()
+        _pos_ev.clear()
+        time.sleep(POS_DEBOUNCE_CLK if (_pos_slot[0] or (0, 0))[1] == "clk" else POS_DEBOUNCE_SEC)
+        v = _pos_slot[0]
+        if not v:
+            continue
+        # input_text один на темп и место: пока готовится вариант темпа (запрос только что ушёл), своё место не шлём поверх него
+        t0 = time.time()
+        while (_var_busy or time.time() - _speed_hook_t[0] < 1.6) and time.time() - t0 < 6:
+            time.sleep(0.2)
+        v = _pos_slot[0] or v
+        try:
+            req = urllib.request.Request(f"http://{HOST}:8123/api/webhook/{SPEED_HOOK}", method="POST",
+                                         data=json.dumps({"id": v[0], "k": v[1], "n": v[2] or str(int(time.time() * 1000) % 10**9)}).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5).read()
+            log(f"место → сервер: {v[1]} {v[0]}")
+        except Exception as e:
+            log(f"место не отправлено: {e!r}")
 
 
 def добрать_свежее():
@@ -1652,7 +1753,7 @@ def добрать_свежее():
                 log(f"не удалось получить часть ответа: {e!r}")
                 continue
             _взяты.add(p.get("id")); _взята_ts[0] = max(_взята_ts[0], p.get("ts", 0))
-            _hist.append(_item(p, data, t))
+            _hist_insert(_item(p, data, t))
             del _hist[:-HIST_MAX]
             _hist_persist(p, data)
             n += 1
@@ -1739,17 +1840,23 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
     start = 0
     _skip_key[0] = None
     poll_now = False            # только что доиграли часть — следующую (она обычно уже в ленте) берём без ожидания
+    gap_from, gap_t0 = None, 0.0   # ord только что доигранной части: пока между ней и следующей в истории есть неготовое — ждём
     final = False
     deadline = time.time() + REPLY_WAIT_SEC
     try:
         while time.time() < deadline:
             if gen != _reply_gen[0]:
                 return
-            if pos < len(_hist):
+            дыра = pos < len(_hist) and _ждём_дыру(gap_from, pos)
+            if дыра and time.time() - gap_t0 > GAP_WAIT_SEC:
+                log("ответ: дыру в предложениях не дождалась — играю дальше")
+                gap_from, дыра = None, False
+            if pos < len(_hist) and not дыра:
                 pos2 = _apply_skip(pos)
                 if pos2 != pos:
                     pos = pos2
                     continue
+                prev_ord = _ord_части(pos)
                 try:
                     res = _play_part(_hist[pos], gen, start)
                 except Exception as e:
@@ -1759,9 +1866,13 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
                 if res == "stop":
                     return
                 pos, start = _step(res, pos)
+                # 04.11.2026: естественный ход (доиграла / нампад «.») — следующая часть обязана идти сразу за этой по ord;
+                # прыжок Alt дыр не ждёт (пропущенный остаток сообщения — сознательный)
+                gap_from = prev_ord if res in ("done", "skip") else None
+                gap_t0 = time.time()
                 poll_now = True
                 continue
-            if final:
+            if final and not дыра:
                 return
             _playing[0] = False                             # ждём следующую часть — это уже простой
             # ждём следующую часть; двойной Alt в тишине — повтор последней. 16.10: опрос ленты чаще (0,4 с вместо 1,5 с) и сразу
@@ -1782,6 +1893,7 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
             except Exception:
                 continue
             ходы = _ходы(meta)
+            _pending[:] = [o for o in (meta.get("pending") or []) if isinstance(o, (int, float))]
             if bg_turn:
                 meta = next((t for t in ходы if t.get("turn") == bg_turn), None)
                 if meta is None:
@@ -1802,7 +1914,9 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
                         data = r.read()
                     if gen != _reply_gen[0]:
                         return
-                    _hist.append(_item(p, data, meta))
+                    j = _hist_insert(_item(p, data, meta))
+                    if j < pos:                             # часть встала позади указателя — он остаётся на той же части
+                        pos += 1                            # (j == pos: указатель — «следующая к игре», новая и есть следующая)
                     _hist_persist(p, data)
                     while len(_hist) > HIST_MAX:            # самую старую часть забываем, указатель сдвигаем вместе с ней
                         _hist.pop(0)
@@ -2334,6 +2448,7 @@ def main():
     _vnesh["obrabotchik"] = on_host
     threading.Thread(target=klav_server, daemon=True).start()
     threading.Thread(target=bg_loop, daemon=True).start()
+    threading.Thread(target=_pos_sender, daemon=True).start()     # 04.11.2026: играющее место — серверу озвучки
     keyboard.hook(on_local)
     log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — назад к началу сообщения (окно 4 с), дважды — вперёд, в тишине — последнее; нампад «.» — следующее предложение, Enter — предыдущее, двойной Enter — заново, «0» — пауза, «+»/«−» — темп предложения, «*» — норма, пока звучит ответ; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
     keyboard.wait()
