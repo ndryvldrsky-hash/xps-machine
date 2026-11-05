@@ -627,23 +627,89 @@ def буфер_записать(text):
         _u32.CloseClipboard()
 
 
-def вставить(text):
-    """Положить текст в окно ОДНИМ движением — через буфер обмена и Ctrl+V (02.10, просьба пользователя).
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+_VK_RETURN = 0x0D
+_ПОРЦИЯ_ЗНАКОВ = 200        # длиннее ~400 знаков — порциями по 200
+_ПОРОГ_ПОРЦИЙ = 400
+_ПАУЗА_ПОРЦИЙ = 0.02
 
-    Посимвольный ввод (keyboard.write) иногда терял ПРОБЕЛЫ — «Ачторежимночи…»: распознавалось верно,
-    но на Windows каждый символ уходит отдельным SendInput KEYEVENTF_UNICODE, и Chromium (окно VS Code)
-    на быстрой очереди часть событий не разбирал. Вставка кладёт всю фразу разом, терять нечего.
-    Прежнее содержимое буфера возвращаем: пользователь мог что-то скопировать для себя.
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_uint16), ("wScan", ctypes.c_uint16), ("dwFlags", ctypes.c_uint32),
+                ("time", ctypes.c_uint32), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MOUSEINPUT(ctypes.Structure):          # нужен только ради верного размера union (INPUT = 40 байт на x64)
+    _fields_ = [("dx", ctypes.c_int32), ("dy", ctypes.c_int32), ("mouseData", ctypes.c_uint32),
+                ("dwFlags", ctypes.c_uint32), ("time", ctypes.c_uint32), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUT_U(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", ctypes.c_uint32), ("u", _INPUT_U)]
+
+
+def _события_ввода(text):
+    """Массив INPUT для строки: на знак — пара KEYEVENTF_UNICODE down/up (wScan = код UTF-16, символы вне BMP —
+    двумя кодами-суррогатами), перевод строки — VK_RETURN down/up, '\\r' пропускаем (CRLF → один Enter)."""
+    ev = []
+
+    def добавить(vk, scan, флаги):
+        e = _INPUT()
+        e.type = _INPUT_KEYBOARD
+        e.ki.wVk, e.ki.wScan, e.ki.dwFlags = vk, scan, флаги
+        ev.append(e)
+
+    for ch in text:
+        if ch == "\r":
+            continue
+        if ch == "\n":
+            добавить(_VK_RETURN, 0, 0)
+            добавить(_VK_RETURN, 0, _KEYEVENTF_KEYUP)
+            continue
+        b = ch.encode("utf-16-le")
+        for i in range(0, len(b), 2):
+            код = b[i] | (b[i + 1] << 8)
+            добавить(0, код, _KEYEVENTF_UNICODE)
+            добавить(0, код, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP)
+    return ev
+
+
+def _отправить_события(ev):
+    """Весь массив — ОДНИМ вызовом SendInput (события идут пачкой). Возвращает число принятых."""
+    if not ev:
+        return 0
+    arr = (_INPUT * len(ev))(*ev)
+    return _u32.SendInput(len(ev), arr, ctypes.sizeof(_INPUT))
+
+
+def вставить(text):
+    """Ввести текст в активное окно БЕЗ буфера обмена (06.11.2026, хозяин ~00:55: «Есть какая-то проблема с
+    диктовкой: я произношу, а он откуда-то берёт непонятно откуда данные. Наверное, он использует клипборд.
+    Надо перестать пользоваться клипбордом при диктовке»).
+
+    Раньше фраза шла через буфер и Ctrl+V, а прежний буфер возвращался через 0,25 с — окно успевало вставить уже
+    его: вместо фразы в чат ушло «cam-tambur2». Теперь буфер не читается, не пишется и Ctrl+V не шлётся.
+    Ввод — одним SendInput с массивом KEYEVENTF_UNICODE (пачка не теряется в Chromium: прежняя потеря пробелов
+    у keyboard.write была из-за пауз между отдельными символами). Длиннее 400 знаков — порциями по 200 с паузой 20 мс.
     """
-    прежнее = буфер_прочитать()
-    if not буфер_записать(text):
-        log("буфер обмена занят — ввожу посимвольно")
-        keyboard.write(text, delay=0.005)
-        return
-    keyboard.send("ctrl+v")
-    time.sleep(0.25)                       # дать окну забрать текст до возврата буфера
-    if прежнее is not None and прежнее != text:
-        буфер_записать(прежнее)
+    if len(text) > _ПОРОГ_ПОРЦИЙ:
+        части = [text[i:i + _ПОРЦИЯ_ЗНАКОВ] for i in range(0, len(text), _ПОРЦИЯ_ЗНАКОВ)]
+    else:
+        части = [text]
+    for n, часть in enumerate(части):
+        if n:
+            time.sleep(_ПАУЗА_ПОРЦИЙ)
+        ev = _события_ввода(часть)
+        принято = _отправить_события(ev)
+        if принято != len(ev):
+            log(f"SendInput принял {принято} из {len(ev)} событий")
 
 
 # ---- 29.10.2026: диктовка в окно Moonlight ----
