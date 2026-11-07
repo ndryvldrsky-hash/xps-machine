@@ -83,6 +83,40 @@ STATUS = os.path.join(HERE, "status.json")   # пульс для витрины 
 def log(msg):
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    if any(k in msg for k in ЖУРНАЛ_ОЗВУЧКИ):
+        _журнал_в_дом(msg)
+
+
+# 07.11.2026 хозяин: «журнал… витрина подключается в момент загрузки и слушает, и когда событие наступает, сразу показывает».
+# События проигрывания уходят вебхуком alena_ozvuchka_log → автоматизация → logbook.log (input_text.ozvuchka_zhurnal) →
+# карточка «Журнал озвучки» на Рупоре получает их сразу по websocket. Отдельный поток, очередь, ошибки — молча.
+ЖУРНАЛ_ОЗВУЧКИ = ("правый Alt одиночный", "назад —", "назад:", "вперёд", "место → сервер: clk", "дождалась следующего",
+                  "не готово за", "ответ голосом прерван", "автоозвучка выкл", "клавиша меню", "ответ голосом", "повтор")
+_журнал_q = queue.Queue(maxsize=200)
+_журнал_поток = [None]
+
+
+def _журнал_в_дом(msg):
+    m = re.search(r"место → сервер: clk (\S+)_(\d+)_(\d+)", msg)
+    if m:
+        msg = f"заиграло: сообщение {m.group(2)}, предложение {m.group(3)}"
+    try:
+        _журнал_q.put_nowait(msg[:250])
+    except queue.Full:
+        return
+    if _журнал_поток[0] is None:
+        def _шлю():
+            while True:
+                m = _журнал_q.get()
+                try:
+                    req = urllib.request.Request(f"http://{HOST}:8123/api/webhook/alena_ozvuchka_log", method="POST",
+                                                 data=json.dumps({"msg": m}).encode("utf-8"),
+                                                 headers={"Content-Type": "application/json"})
+                    urllib.request.urlopen(req, timeout=3).read()
+                except Exception:
+                    pass
+        _журнал_поток[0] = threading.Thread(target=_шлю, daemon=True)
+        _журнал_поток[0].start()
 
 
 # 26.09 (просьба пользователя «более мягкий звук, чем писк»): вместо winsound.Beep (прямоугольный писк полной громкости) —
@@ -1549,6 +1583,36 @@ def _play_part_ws(item, gen):
     return res
 
 
+def _индекс(item, pos):
+    """Текущий номер части item в _hist (по самой части, не по номеру — история сдвигается); не нашли — прежний pos."""
+    if 0 <= pos < len(_hist) and _hist[pos] is item:
+        return pos
+    for i in range(len(_hist) - 1, -1, -1):
+        if _hist[i] is item:
+            return i
+    return pos
+
+
+def _дождаться_хвоста(gen, last_item):
+    """Конец истории при игре по Alt: если дом ещё готовит предложения дальше (pending в ленте) — ждать их до GAP_WAIT_SEC.
+    Возвращает номер следующей за last_item части, когда она появилась; None — ждать нечего, оборвали или не дождались."""
+    t0 = time.time()
+    last = last_item[6] if len(last_item) > 6 else None
+    while time.time() - t0 < GAP_WAIT_SEC:
+        if _reply_gen[0] != gen:
+            return None
+        добрать_свежее()
+        j = _индекс(last_item, len(_hist) - 1) + 1
+        if j < len(_hist):
+            log(f"дождалась следующего предложения за {time.time() - t0:.1f} с — играю дальше")
+            return j
+        if not any(last is None or o > last for o in _pending):
+            return None
+        time.sleep(0.3)
+    log(f"следующее предложение не готово за {GAP_WAIT_SEC} с — стоп")
+    return None
+
+
 def replay_tail():
     """Повтор с последней сыгранной части, когда ничего не играет; Alt и двойной Alt ходят по истории так же."""
     _reply_gen[0] += 1
@@ -1563,14 +1627,28 @@ def replay_tail():
         _skip_key[0] = None
         pos = _tail_pos(новых)
         start = 0
-        while 0 <= pos < len(_hist):
-            pos = _apply_skip(pos)
-            if pos >= len(_hist):
+        last_item = None
+        while True:
+            while 0 <= pos < len(_hist):
+                pos = _apply_skip(pos)
+                if pos >= len(_hist):
+                    break
+                item = _hist[pos]
+                res = _play_part(item, gen, start)
+                if res == "stop":
+                    return
+                # 07.11.2026: история упирается в HIST_MAX — новые части добавляются в конец, старые срезаются с начала, номера
+                # сдвигаются; место ищем заново по самой сыгранной части, иначе плеер перескакивал через предложение
+                pos = _индекс(item, pos)
+                last_item = item
+                pos, start = _step(res, pos)
+            # 07.11.2026 хозяин: «озвучка, которая доходит до ещё не загруженного сообщения, после загрузки не продолжает играть» —
+            # дом теперь готовит только два следующих предложения, поэтому в конце истории ждём, пока впереди есть ждущие
+            if pos < len(_hist) or last_item is None:
                 break
-            res = _play_part(_hist[pos], gen, start)
-            if res == "stop":
-                return
-            pos, start = _step(res, pos)
+            pos = _дождаться_хвоста(gen, last_item)
+            if pos is None:
+                break
     except Exception as e:
         _playing[0] = False
         log(f"не удалось повторить часть ответа: {e!r}")
@@ -1807,6 +1885,7 @@ def добрать_свежее():
         log(f"лента ответа не прочитана: {e!r}")
         return 0
     n = 0
+    _pending[:] = [o for o in (meta.get("pending") or []) if isinstance(o, (int, float))]   # 07.11: ждущие — и для игры по Alt
     # 04.11.2026: лента — очередь ходов; в историю идёт всё, чего там ещё нет (старое поле parts — копия последнего хода)
     for t in _ходы(meta):
         for p in t.get("parts") or []:
