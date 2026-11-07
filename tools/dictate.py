@@ -76,6 +76,7 @@ MIC_STALL_SEC = 5.0              # колбэк микрофона молчит 
 MIC_FAILS_RESTART = 3            # столько неудачных переоткрытий подряд на консоли — перезапуск всего процесса
 MIN_UPTIME_RESTART = 120.0       # не перезапускаться чаще раза в 2 мин (микрофона нет вовсе — не крутиться)
 GUARD_STALL_SEC = 120.0          # пульс status.json из _wake_step молчит дольше (на консоли) — поток завис, перезапуск
+GUARD_STALL_REPLY_SEC = 300.0    # 07.11.2026: пока жив цикл ответа (слушают) — ждём дольше: перезапуск 17:29 оборвал ответ на середине
 START_T = time.time()
 STATUS = os.path.join(HERE, "status.json")   # пульс для витрины «Диктовка» (раз в 30 с)
 
@@ -1613,6 +1614,34 @@ def _дождаться_хвоста(gen, last_item):
     return None
 
 
+def _дождаться_дыры(gen, last_item):
+    """07.11.2026 хозяин: «когда я слушаю и приходит ответ, он встаёт по очереди тогда, когда он пришёл… надо, чтобы все
+    предложения были по порядку, как они видны в чате». Дом заранее озвучивает первое предложение КАЖДОГО сообщения, а в текущем —
+    только два вперёд; первое предложение нового сообщения вставало в историю сразу за последним готовым текущего, и игра по Alt
+    перескакивала в новое. Теперь при естественном шаге: пока между сыгранной частью и следующей в истории есть ещё не готовые
+    (pending) предложения — ждём их до GAP_WAIT_SEC. Возвращает номер следующей по порядку части или None (ждать нечего/не дождались)."""
+    last = last_item[6] if len(last_item) > 6 else None
+    if last is None:
+        return None
+    t0, ждала = time.time(), False
+    while time.time() - t0 < GAP_WAIT_SEC:
+        if _reply_gen[0] != gen:
+            return None
+        добрать_свежее()
+        j = _индекс(last_item, len(_hist) - 1) + 1
+        nxt = _hist[j][6] if j < len(_hist) and len(_hist[j]) > 6 else None
+        if nxt is None or not any(last < o < nxt for o in _pending):
+            if ждала:
+                log(f"дождалась пропущенного предложения за {time.time() - t0:.1f} с — играю по порядку")
+            return j
+        if not ждала:
+            log("следующее по порядку предложение ещё готовится — жду его, новое сообщение подождёт")
+            ждала = True
+        time.sleep(0.3)
+    log(f"пропущенное предложение не готово за {GAP_WAIT_SEC} с — играю дальше")
+    return None
+
+
 def replay_tail():
     """Повтор с последней сыгранной части, когда ничего не играет; Alt и двойной Alt ходят по истории так же."""
     _reply_gen[0] += 1
@@ -1642,6 +1671,10 @@ def replay_tail():
                 pos = _индекс(item, pos)
                 last_item = item
                 pos, start = _step(res, pos)
+                if res in ("done", "skip") and pos < len(_hist):     # шаг к следующему предложению — не через неготовое
+                    j = _дождаться_дыры(gen, item)
+                    if j is not None:
+                        pos, start = j, 0
             # 07.11.2026 хозяин: «озвучка, которая доходит до ещё не загруженного сообщения, после загрузки не продолжает играть» —
             # дом теперь готовит только два следующих предложения, поэтому в конце истории ждём, пока впереди есть ждущие
             if pos < len(_hist) or last_item is None:
@@ -2233,6 +2266,8 @@ class Voice:
             now = time.time()
             if now - START_T < MIN_UPTIME_RESTART or now - self.status_t < GUARD_STALL_SEC:
                 continue
+            if (_live_gen[0] or _playing[0]) and now - self.status_t < GUARD_STALL_REPLY_SEC:
+                continue                     # слушают ответ — не обрываем, ждём до GUARD_STALL_REPLY_SEC
             try:
                 if not self._on_console():
                     continue
@@ -2371,7 +2406,10 @@ class Voice:
             self.ring.append(block)
             # 24.09: не слушать «Алёну», пока играет голосовой ответ (+0,5 с): клиент слышал ответ из динамиков и слал каждую
             # его фразу пробой в GigaAM — аддон Whisper на Нуксе ел 600 % CPU (петля эха). Прервать ответ — правый Ctrl.
-            if voiced and self.wake_enabled and not self.rec and not self.busy and not _playing[0] and now - self.last_key > KEY_QUIET_SEC:
+            # 07.11.2026: и всю сессию прослушивания (_live_gen) — в паузах между предложениями эхо озвучки уходило в пробу GigaAM,
+            # шаг висел на распознавании, пульс молчал 129 с, и сторож перезапустил плеер посреди ответа
+            if (voiced and self.wake_enabled and not self.rec and not self.busy and not _playing[0] and not _live_gen[0]
+                    and now - self.last_key > KEY_QUIET_SEC):
                 self.voiced_n = 0
                 self.seg = list(self.ring)               # 0,3 с до начала речи
                 self.seg_t0 = now
