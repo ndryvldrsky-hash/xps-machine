@@ -46,7 +46,10 @@ STT_CONNECT_SEC = 0.7                 # выключенная Кузница н
 _stt_skip = {}                        # адрес → время, до которого его не пробовать (после неудачи)
 RATE = 16000
 BLOCK = 480                      # 30 мс
-HOTKEY = "right ctrl"
+# 07.11.2026 (хозяин: «поменяем местами их функционал» — на Bluetooth-клавиатуре нет правого Ctrl):
+# диктовка и стоп озвучки — правый Shift, смена голоса (одиночный/двойной) — правый Ctrl. Раньше было наоборот.
+HOTKEY = "right shift"
+VOICE_KEY = "right ctrl"
 SKIP_KEYS = ("right alt", "alt gr")   # короткое нажатие одного правого Alt — следующая часть голосового ответа (28.09)
 MIN_SEC = 0.3
 LOG = os.path.join(HERE, "dictate.log")
@@ -608,6 +611,20 @@ _u32.EmptyClipboard.argtypes, _u32.EmptyClipboard.restype = [], wintypes.BOOL
 _u32.GetClipboardData.argtypes, _u32.GetClipboardData.restype = [wintypes.UINT], wintypes.HANDLE
 _u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
 _u32.SetClipboardData.restype = wintypes.HANDLE
+_u32.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD, ctypes.POINTER(wintypes.ULONG)]
+_u32.keybd_event.restype = None
+DUMMY_VK = 0xE8    # незанятый виртуальный код: клавиша-пустышка, скан-код 0
+
+
+def пустышка():
+    """07.11.2026 (хозяин: «при нажатии на Alt… фокус уходит из поля»): одиночный Alt в Windows переводит фокус в меню окна
+    (в браузере — на кнопку меню). Пока правый Alt зажат, «нажимаем» пустую клавишу — Windows считает, что было сочетание,
+    и фокус не трогает (так же делает AutoHotkey: Send {Blind}{vk07}). Свои хуки это событие узнают по скан-коду 0 и пропускают."""
+    try:
+        _u32.keybd_event(DUMMY_VK, 0, 0, None)
+        _u32.keybd_event(DUMMY_VK, 0, 2, None)      # KEYEVENTF_KEYUP
+    except Exception as e:
+        log(f"пустышка Alt не сыграла: {e!r}")
 _k32.GlobalAlloc.argtypes, _k32.GlobalAlloc.restype = [wintypes.UINT, ctypes.c_size_t], wintypes.HGLOBAL
 _k32.GlobalLock.argtypes, _k32.GlobalLock.restype = [wintypes.HGLOBAL], wintypes.LPVOID
 _k32.GlobalUnlock.argtypes, _k32.GlobalUnlock.restype = [wintypes.HGLOBAL], wintypes.BOOL
@@ -817,7 +834,7 @@ def klav_vneshnyaya(sob):
     title = foreground_title()
     if not moonlight_host(title):
         # отпускание правого Ctrl, нажатого при окне Moonlight, всё же принимаем — иначе запись не закончится
-        if not (k == "rctrl" and typ == "up" and _vnesh["rec"]):
+        if not (KLAV_IMENA.get(k) == HOTKEY and typ == "up" and _vnesh["rec"]):
             if k != "other" and time.time() - _vnesh["ignor_t"] > 30:
                 _vnesh["ignor_t"] = time.time()
                 log(f"клавиша с хоста ({k} {typ}) — впереди не Moonlight («{title[:40]}»), игнорирую")
@@ -841,9 +858,9 @@ def klav_vneshnyaya(sob):
     if f is None:
         return "ещё не готово"
     f(e)
-    if k == "rctrl":
+    if name == HOTKEY:
         _vnesh["rec"] = typ == "down"
-        log(f"клавиша с хоста: правый Ctrl {'нажат — запись' if typ == 'down' else 'отпущен'}")
+        log(f"клавиша с хоста: {HOTKEY} {'нажата — запись' if typ == 'down' else 'отпущена'}")
     return "принято"
 
 
@@ -940,7 +957,12 @@ SENT_BACK_SEC = 1.5         # «назад»: если с начала теку�
 OUT_DEVICE_FILE = os.path.join(HERE, "out_device")   # необязательно: номер или кусок имени устройства вывода (если звук идёт не туда)
 _paused = [False]           # 16.10.2026: пауза озвучки (Backspace), общая для всех частей
 _nav = [None]               # «prev» / «next» от нампада — забирает цикл проигрывания части
-_np_state = {"remove": None, "held": set()}
+_np_state = {"remove": None, "held": set(), "ralt": False, "combo_t": 0.0}
+# 07.11.2026 (хозяин: на Bluetooth-клавиатуре нет нампада) — те же команды аккордами с правым Alt, пока звучит озвучка:
+# Alt+→ — предыдущее предложение, Alt+← — следующее (так сказал хозяин), Alt+«,» — медленнее, Alt+«.» — быстрее,
+# Alt+«/» — темп к норме. Пауза/продолжить — ОДИНОЧНЫЙ правый Alt во время озвучки (alt_fire; аккорд Alt+↓ хозяин велел убрать).
+# Скан-коды (не зависят от раскладки): → 77, ← 75, «,» 51, «.» 52, «/» 53.
+ALT_CHORDS = {77: "prev", 75: "next", 51: "slower", 52: "faster", 53: "reset"}
 _np_lock = threading.Lock()
 _out_dev_logged = [False]
 
@@ -976,6 +998,25 @@ def _np_filter(e):
     Всё остальное — True (клавиша идёт дальше как обычно). Должен работать мгновенно: вызывается на каждое нажатие."""
     try:
         sc, kp = e.scan_code, bool(getattr(e, "is_keypad", False))
+        if sc == 0:
+            return True                              # клавиша-пустышка — мимо
+        held = _np_state["held"]
+        # 07.11.2026: аккорды с правым Alt (ALT_CHORDS) — сам Alt пропускаем дальше, его состояние запоминаем здесь же
+        # (on_event получает события позже и асинхронно); клавишу аккорда глотаем, чтобы Alt+← / Alt+→ не ушли в браузер как «назад/вперёд»
+        if getattr(e, "name", None) in SKIP_KEYS or sc == 541:
+            _np_state["ralt"] = e.event_type == "down"
+            return True
+        if sc in ALT_CHORDS and (_np_state["ralt"] or keyboard.is_pressed("right alt")):
+            k = "alt_" + ALT_CHORDS[sc]
+            if e.event_type == "down":
+                if k not in held:
+                    held.add(k)
+                    _nav[0] = ALT_CHORDS[sc]
+                    _np_state["combo_t"] = time.time()      # одиночный Alt после аккорда не должен прыгать к началу сообщения
+                    log(f"аккорд Alt+{sc} — {ALT_CHORDS[sc]} (озвучка)")
+                return False
+            held.discard(k)
+            return False
         # 16.10.2026 хозяин: пауза — «0» нампада (скан-код 82 + keypad), не Backspace: тот шлёт один код с обычным и мешал бы стирать
         if kp:
             k = {83: "next", 28: "prev", 74: "slower", 78: "faster", 55: "reset", 82: "pause"}.get(sc)
@@ -2149,6 +2190,7 @@ class Voice:
         # --- диктовка по клавише
         self.rec = False
         self.cancelled = False
+        self.cancel_key = None       # 07.11.2026: какая клавиша сорвала запись — в журнал при отпускании Ctrl
         self.t0 = 0.0
         self.chunks = []
         # --- «Алёна»
@@ -2306,6 +2348,9 @@ class Voice:
         self.rec = False
         dur = time.time() - self.t0
         if self.cancelled or dur < MIN_SEC:
+            # 07.11.2026 вечер: с 21:46 ни одна запись не доходила до распознавания, а журнал молчал — теперь причина видна
+            log(f"запись {dur:.1f} с не отправлена: " + (f"отменена клавишей {self.cancel_key!r}" if self.cancelled
+                                                        else f"короче {MIN_SEC} с"))
             return
         if not self.chunks:
             log(f"клавиша: {dur:.1f} с, но с микрофона не пришло ни одного куска звука")
@@ -2576,10 +2621,29 @@ def main():
 
     def alt_fire():
         alt["timer"] = None
+        if _playing[0]:
+            # 07.11.2026 хозяин: «Alt в процессе озвучки не запускает сначала, а ставит на паузу» (и снимает её)
+            _nav[0] = "pause"
+            log(f"правый Alt одиночный → {'продолжить' if _paused[0] else 'пауза'} (озвучка идёт)")
+            return
         log(f"правый Alt одиночный → назад (цикл={'да' if _live_gen[0] else 'нет'}, играет={'да' if _playing[0] else 'нет'}, частей в истории {len(_hist)})")
         prev_part()      # 16.10.2026 хозяин поменял: одиночный правый Alt — назад (к началу текущего/предыдущего сообщения)
 
+    _sl_stat = {"t": 0.0, "n": 0}     # 07.11.2026 вечер: счётчик событий Scroll Lock (скан 70) — они срывали записи
+
     def on_event(e):
+        if getattr(e, "scan_code", None) == 0 and not getattr(e, "vnesh", False):
+            return                                   # клавиша-пустышка (см. пустышка()) — не «другая клавиша»
+        # 07.11.2026 вечер (дождь): клавиша Scroll Lock дребезжит по 40–66 нажатий за 6–8 с; при зажатом правом Ctrl Windows
+        # отдаёт её как Ctrl+Break (vk 3, имя '\x03'), и каждая запись срывалась как «отменена другой клавишей». В диктовке
+        # Scroll Lock и Pause/Break не нужны — не замечаем их вовсе (ни отмены, ни last_key), только считаем в журнал раз в 5 с.
+        if getattr(e, "scan_code", None) in (70, 69) or e.name in ("scroll lock", "pause", "\x03"):
+            _sl_stat["n"] += 1
+            if time.time() - _sl_stat["t"] > 5:
+                log(f"Scroll Lock/Break (скан {getattr(e, 'scan_code', None)}): {_sl_stat['n']} событий за "
+                    f"{min(time.time() - _sl_stat['t'], 9999):.0f} с, последнее {e.event_type} имя={e.name!r} — не замечаю")
+                _sl_stat.update(t=time.time(), n=0)
+            return
         # 04.11.2026 (хозяин: «Alt не работает»): на раскладке, где правый Alt — AltGr, Windows шлёт его как «фальшивый Ctrl»
         # (скан-код 541, vk 162), а библиотека keyboard при ОТПУСКАНИИ называет это событие 'ctrl' (при нажатии — 'alt gr').
         # Отпускание не совпадало с SKIP_KEYS, Alt залипал «нажатым» и ни одно нажатие не срабатывало. Приводим к 'right alt'.
@@ -2587,7 +2651,7 @@ def main():
             e.name = "right alt"
         if e.event_type == "down":
             v.last_key = time.time()
-        if e.name == "right shift":
+        if e.name == VOICE_KEY:
             if e.event_type == "down":
                 if not rsh["down"]:
                     rsh.update(down=True, other=False)
@@ -2617,10 +2681,11 @@ def main():
                     alt["down"] = False
                 if not alt["down"]:
                     alt.update(down=True, other=False, t=time.time())
+                    пустышка()                       # чтобы одиночный Alt не уводил фокус в меню окна
             else:
-                if alt["down"] and not alt["other"]:
+                if alt["down"] and not alt["other"] and _np_state["combo_t"] < alt.get("t", 0.0):
                     # 06.11.2026 хозяин: «вперёд» (был двойной Alt) — на клавише контекстного меню, поэтому одиночный Alt
-                    # срабатывает сразу, без ожидания второго нажатия
+                    # срабатывает сразу, без ожидания второго нажатия. 07.11: после аккорда Alt+клавиша (проглочен в _np_filter) — не прыгать
                     alt["last"] = time.time()
                     threading.Thread(target=alt_fire, daemon=True).start()
                 alt["down"] = False
@@ -2640,6 +2705,7 @@ def main():
                 v.key_stop()
         elif e.event_type == "down" and v.rec:
             v.cancelled = True
+            v.cancel_key = (e.name, getattr(e, "scan_code", None))
 
     zamok = threading.Lock()     # свой хук и клавиши с хоста Moonlight приходят из разных потоков
 
@@ -2677,7 +2743,7 @@ def main():
         keyboard.hook_key("applications", on_menu, suppress=True)
     except Exception as e:
         log(f"клавиша меню не перехвачена: {e!r}")
-    log("запущено: правый Ctrl — диктовка (и оборвать ответ); правый Alt — назад к началу сообщения (окно 4 с), в тишине — последнее; клавиша меню — вперёд, к следующему сообщению; нампад «.» — следующее предложение, Enter — предыдущее, двойной Enter — заново, «0» — пауза, «+»/«−» — темп предложения, «*» — норма, пока звучит ответ; «Алёна, …» — фраза в активное окно (в VS Code с Enter); правый Shift — следующий голос, двойной — случайный")
+    log(f"запущено: {HOTKEY} — диктовка (и оборвать ответ), {VOICE_KEY} — следующий голос, двойной — случайный; правый Alt — назад к началу сообщения (окно 4 с), в тишине — последнее; клавиша меню — вперёд, к следующему сообщению; нампад «.» — следующее предложение, Enter — предыдущее, двойной Enter — заново, «0» — пауза, «+»/«−» — темп предложения, «*» — норма, пока звучит ответ; «Алёна, …» — фраза в активное окно (в VS Code с Enter)")
     keyboard.wait()
 
 
