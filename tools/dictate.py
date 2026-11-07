@@ -1607,7 +1607,7 @@ def on_enter():
         log(f"Enter после диктовки — не жду ответ: впереди окно «{title[:60]}», не чат")
         return
     log(f"Enter после диктовки — жду ответ голосом на «{text[:60]}» (фраз в сообщении: {len(все)})")
-    threading.Thread(target=speak_reply, args=(text, time.time(), все), daemon=True).start()
+    ответ_голосом(text, time.time(), все)
 
 
 def norm(t):
@@ -1830,6 +1830,29 @@ _bg_done = set()         # ходы от уведомлений (bg в лент�
 BG_FRESH_SEC = 900       # часть старше — не играем (после перезапуска/простоя старое не озвучивается)
 
 
+АВТО_ФАЙЛ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "автоозвучка.txt")
+
+
+def автоозвучка():
+    """07.11.2026 хозяин: «чтобы оно сразу само не запускалось, когда приходит, а только с кнопки Alt». Файл автоозвучка.txt
+    рядом со скриптом: «вкл» — ответы играют сами, как раньше; нет файла или «выкл» — только складываются в историю,
+    а играет их правый Alt (в тишине он ставит непрозвучавший ответ, см. prev_part → replay_tail)."""
+    try:
+        with open(АВТО_ФАЙЛ, encoding="utf-8") as f:
+            return f.read().strip().lower().startswith("вкл")
+    except OSError:
+        return False
+
+
+def ответ_голосом(text, t_sent, фразы=None):
+    """Запуск ожидания ответа голосом — только при включённой автоозвучке; иначе пометить фразу и ждать Alt."""
+    if автоозвучка():
+        threading.Thread(target=speak_reply, args=(text, t_sent, фразы), daemon=True).start()
+    else:
+        mark_voice(text)
+        log("автоозвучка выкл — ответ прозвучит по правому Alt")
+
+
 def bg_loop():
     """04.11.2026 (хозяин: «ответы после ответов помощниц молчат — можно их тоже говорить?»): ход, начатый не хозяином
     (<task-notification> и т.п.) в голосовой сессии, voice_reply.py помечает в ленте bg=True. Его мои ответы играются так же,
@@ -1851,6 +1874,12 @@ def bg_loop():
                     _bg_done.add(t["turn"])
             continue
         if _live_gen[0]:
+            continue
+        if not автоозвучка():              # 07.11.2026: без автоозвучки ходы от уведомлений не играют — только в историю для Alt
+            try:
+                добрать_свежее()
+            except Exception as e:
+                log(f"добор в историю: {e!r}")
             continue
         выбран = None
         for t in ходы:                     # очередь: самый ранний непроигранный ход «фон/печать» со свежими частями
@@ -2374,7 +2403,7 @@ class Voice:
                 time.sleep(0.15)
                 keyboard.send("enter")
                 _armed.update(text="", t=0.0, все=[])   # сообщение ушло само — ручного Enter ждать нечего
-                threading.Thread(target=speak_reply, args=(text, time.time()), daemon=True).start()
+                ответ_голосом(text, time.time())
             elif code_win:
                 # диктовка правым Ctrl в чат Code: ответ озвучим, когда пользователь сам нажмёт Enter (28.09).
                 # Ключ сопоставления — ПЕРВАЯ фраза сообщения: следующие диктовки до Enter её не перезаписывают.
