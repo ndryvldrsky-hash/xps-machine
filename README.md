@@ -75,7 +75,7 @@ Windows Terminal с логом. У `MediaMTX` рабочая папка `W:\medi
 знаками секунд, `$hz` раз в секунду, по умолчанию 2 — каждый герц стоит ~9% ядра). `webcam_push.ps1`
 запускает рендерер (проверка живости по `render.pid`), накладывает оба слоя фильтром `overlay`,
 пишет для него `progress.txt` (`-progress`) и `yavg.txt` (signalstats) и больше не рисует drawtext.
-Подгруппу «Home Assistant» рендерер забирает по HTTP с `http://192.168.77.2:8123/local/xps_overlay_extra.txt`
+Подгруппу «Home Assistant» рендерер забирает по HTTP с `http://192.168.77.220:8123/local/xps_overlay_extra.txt`
 (HA кладёт её раз в минуту, автоматизация «Камеры: данные HA в оверлеи»).
 
 Грабли Windows/ffmpeg, поймано вживую: путь с буквой диска в опции `file=` фильтра не проходит

@@ -46,7 +46,7 @@ static class Aurora3D
     static readonly string DIR = @"W:\tools\aurora3d\";
     static readonly string FFMPEG = @"W:\ffmpeg\ffmpeg-9.0.1-essentials_build\bin\ffmpeg.exe";
     static readonly string SRC = "rtsp://127.0.0.1:8554/xps_sub";
-    static readonly string HA_HOST = "192.168.77.2";
+    static readonly string HA_HOST = "192.168.77.220";
     static readonly string HASS_AGENT_CFG = @"W:\Users\rdpuser\AppData\Local\HASS.Agent\Client\config\appsettings.json";
     const int ONVIF_PORT = 8099;
     static readonly string LOG = DIR + "aurora3d.log";
