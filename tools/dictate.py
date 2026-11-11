@@ -534,8 +534,11 @@ def beep(*tones):
         log(f"мотив: {pool[_motif[fr][0]][0]}")
         balloon(("♪ " if fr == 1200 else "♫ ") + pool[_motif[fr][0]][0])
 
+    t0 = time.perf_counter()
+
     def run():
         try:
+            t1 = time.perf_counter()
             gap = np.zeros(int(0.03 * BEEP_SR), np.float32)
             parts = []
             for fr, ms in tones:
@@ -544,7 +547,20 @@ def beep(*tones):
             buf = io.BytesIO()
             with wave.open(buf, "wb") as wf:
                 wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(BEEP_SR); wf.writeframes(pcm)
-            winsound.PlaySound(buf.getvalue(), winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+            # 11.11.2026 хозяин: «нажимаю кнопку, говорю, а мелодия играет потом». Замер: поток и сборка — 0–1 мс, а синхронный
+            # PlaySound из памяти из разных потоков вставал В ОЧЕРЕДЬ: «слушаю» ждало, пока доиграет «отправлено» (2–3,7 с
+            # при длине ~1 с). Теперь асинхронно из файла (SND_ASYNC из памяти Windows не умеет): новый сигнал сразу
+            # обрывает играющий. Файл на каждый звук свой, пишется один раз.
+            путь = os.path.join(BEEP_DIR, f"{hmac.new(b'beep', pcm, 'md5').hexdigest()}.wav")
+            if not os.path.exists(путь):
+                os.makedirs(BEEP_DIR, exist_ok=True)
+                with open(путь + ".tmp", "wb") as f:
+                    f.write(buf.getvalue())
+                os.replace(путь + ".tmp", путь)
+            winsound.PlaySound(путь, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            t2 = time.perf_counter()
+            if t2 - t0 > 0.15:
+                log(f"сигнал медленно: поток {1000*(t1-t0):.0f} мс, до звука {1000*(t2-t0):.0f} мс")
         except Exception as e:   # нет устройства вывода — прежний писк лучше тишины
             log(f"мягкий сигнал не сыграл: {e!r}")
             for fr, ms in tones:
@@ -955,6 +971,7 @@ def foreground_title() -> str:
 REPLY_URL = f"http://{HOST}:8123/local/voice_reply/"
 REPLY_WAIT_SEC = 1800     # ответ озвучивается целиком по концу моего хода — ход бывает долгим
 REPLY_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reply.wav")
+BEEP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "сигналы_кэш")   # WAV сигналов для SND_ASYNC (11.11.2026)
 _reply_gen = [0]           # номер последней отправленной голосом фразы: новая фраза отменяет ожидание старого ответа
 _playing = [False]
 _skip = [False]            # правый Alt: оборвать текущую часть ответа и перейти к следующей
