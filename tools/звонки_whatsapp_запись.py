@@ -31,6 +31,7 @@ FFMPEG = r"W:\ffmpeg\ffmpeg-9.0.1-essentials_build\bin\ffmpeg.exe"
 ПАКЕТ = "5319275A.WhatsAppDesktop_cv1g1gvanyjgm"
 КЛЮЧ_МИК = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone" + "\\" + ПАКЕТ
 RATE_OUT = 16000
+ОПРОС_ВНЕ_ЗВОНКА_СЕК = 4   # хозяин 10.11.2026: 4 с вне звонка (во время записи — 1 с)
 ХВОСТ_СЕК = 3          # столько секунд без признаков звонка — звонок окончен
 
 
@@ -248,7 +249,7 @@ def main():
                 except Exception: pass
                 зап = None
             time.sleep(5)
-        time.sleep(1)
+        time.sleep(1 if зап is not None else ОПРОС_ВНЕ_ЗВОНКА_СЕК)
 
 
 if __name__ == "__main__":

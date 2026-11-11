@@ -20,6 +20,8 @@
    Части без поля msg (старый формат, в т.ч. с marks) — по-старому.
    Диктовка правым Ctrl в чат Code тоже получает ответ голосом — после ручного Enter (без Shift), до 10 мин.
    (voice_reply.py в аддоне Студии, в Штабе; голос Gemini, запасные Silero и Piper).
+   10.11.2026 (хозяин): команды нампада в озвучке УБРАНЫ (двойной Enter тоже) — остались только аккорды правого Alt,
+   правый Ctrl и клавиша меню; описание ниже про нампад — история.
    16.10.2026 (хозяин): нампад — Backspace пауза/продолжить; «+»/«−» — темп ТЕКУЩЕГО предложения (шаги 0,6…1,3; предложение озвучивается
    заново Gemini TTS с подсказкой темпа, пока оно готовится ~3–5 с — тишина), «*» — темп к норме. Коррекция помнится за предложением.
    (Vosk small-ru не подошёл: в его словаре нет имени «Алёна».)
@@ -32,7 +34,7 @@
 Выключить режим «Алёна», не трогая диктовку: создать файл no_wake рядом со скриптом (проверяется каждую секунду).
 Запуск: задача планировщика «AlenaDictate» при входе rdpuser (pythonw). Лог — dictate.log рядом.
 """
-import collections, ctypes, hmac, io, wave, datetime, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.error, urllib.request, winsound
+import collections, ctypes, hmac, io, wave, datetime, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, winsound
 from ctypes import wintypes
 
 import keyboard
@@ -49,8 +51,9 @@ BLOCK = 480                      # 30 мс
 # 07.11.2026 (хозяин: «поменяем местами их функционал» — на Bluetooth-клавиатуре нет правого Ctrl):
 # диктовка и стоп озвучки — правый Shift, смена голоса (одиночный/двойной) — правый Ctrl. Раньше было наоборот.
 HOTKEY = "right shift"
-VOICE_KEY = "right ctrl"
-SKIP_KEYS = ("right alt", "alt gr")   # короткое нажатие одного правого Alt — следующая часть голосового ответа (28.09)
+# 10.11.2026 (хозяин): правый Ctrl отключён — голос меняется только аккордами Alt+M / Alt+N
+VOICE_KEY = None
+SKIP_KEYS = ("right alt", "alt gr")   # правый Alt: одиночный — автоозвучка вкл/выкл, аккорды — _alt_filter (10.11.2026)
 MIN_SEC = 0.3
 LOG = os.path.join(HERE, "dictate.log")
 NO_WAKE = os.path.join(HERE, "no_wake")
@@ -95,7 +98,7 @@ def log(msg):
 # События проигрывания уходят вебхуком alena_ozvuchka_log → автоматизация → logbook.log (input_text.ozvuchka_zhurnal) →
 # карточка «Журнал озвучки» на Рупоре получает их сразу по websocket. Отдельный поток, очередь, ошибки — молча.
 ЖУРНАЛ_ОЗВУЧКИ = ("правый Alt одиночный", "назад —", "назад:", "вперёд", "место → сервер: clk", "дождалась следующего",
-                  "не готово за", "ответ голосом прерван", "автоозвучка выкл", "клавиша меню", "ответ голосом", "повтор")
+                  "не готово за", "ответ голосом прерван", "автоозвучка выкл", "клавиша меню", "ответ голосом", "повтор", "аккорд ")
 _журнал_q = queue.Queue(maxsize=200)
 _журнал_поток = [None]
 
@@ -804,10 +807,12 @@ def отправить_на_хост(addr, text):
 # Moonlight известного хоста — иначе игнор (двойных срабатываний нет). Дальше — тот же on_event, что и у своих клавиш.
 KLAV_PORT = 10321
 KLAV_SETI = ("192.168.77.0/24", "100.64.0.0/10", "127.0.0.0/8")
-KLAV_IMENA = {"rctrl": "right ctrl", "ralt": "right alt", "rshift": "right shift", "enter": "enter", "kp_enter": "enter",
+KLAV_IMENA = {"ralt": "right alt", "rshift": "right shift", "enter": "enter", "kp_enter": "enter",
               "other": "внешняя прочая"}
-KLAV_NAMPAD = {"kp_dot": "next", "kp_enter": "prev", "kp_minus": "slower", "kp_plus": "faster", "kp_star": "reset",
-               "kp_0": "pause"}
+# 10.11.2026 (хозяин): нампад в озвучке убран — остались только аккорды правого Alt (KLAV_NAMPAD удалён)
+# 10.11.2026: аккорды правого Alt с хоста (diktovka_priem.py KLAVISHI_ALT) → скан-код Windows, дальше те же ALT_ВСЕГДА/ALT_ОЗВУЧКА
+KLAV_ALT = {"a_up": 72, "a_down": 80, "a_right": 77, "a_left": 75, "a_space": 57, "a_enter": 28, "a_m": 50, "a_n": 49,
+            "a_comma": 51, "a_dot": 52, "a_slash": 53}
 _vnesh = {"obrabotchik": None, "okno": "", "ignor_t": 0.0, "rec": False}
 _dedup = {}                 # (источник, имя, тип) → время: одна и та же клавиша и от своего хука, и с хоста — один раз
 _dedup_lock = threading.Lock()
@@ -815,7 +820,7 @@ _dedup_lock = threading.Lock()
 
 def klav_dubl(src, name, typ):
     """True — такое же событие только что пришло из другого источника (свой хук / хост Moonlight)."""
-    if name not in ("right ctrl", "right alt", "alt gr", "right shift", "enter"):
+    if name not in ("right ctrl", "right alt", "alt gr", "right shift", "enter") and not str(name).startswith("аккорд:"):
         return False
     name = "right alt" if name == "alt gr" else name
     now = time.time()
@@ -839,11 +844,22 @@ def klav_vneshnyaya(sob):
                 _vnesh["ignor_t"] = time.time()
                 log(f"клавиша с хоста ({k} {typ}) — впереди не Moonlight («{title[:40]}»), игнорирую")
             return "игнор: впереди не Moonlight"
-    if k in KLAV_NAMPAD and typ == "down" and _np_state["remove"] is not None:
-        # нампад во время озвучки — как в _np_filter (на хосте клавиша при этом всё равно дойдёт до окна)
-        _nav[0] = KLAV_NAMPAD[k]
-        log(f"клавиша с хоста: {k} — {KLAV_NAMPAD[k]} (озвучка)")
-        return "нампад"
+    if k in KLAV_ALT:
+        # 10.11.2026: аккорд правого Alt с хоста (слушатель шлёт a_*, только пока там зажат правый Alt) — как в _alt_filter
+        if typ != "down":
+            return "аккорд: отпускание не нужно"
+        sc = KLAV_ALT[k]
+        if sc in ALT_ВСЕГДА:
+            cmd = ALT_ВСЕГДА[sc]
+        elif озвучка_активна():
+            cmd = ALT_ОЗВУЧКА[sc]
+        else:
+            _np_state["combo_t"] = time.time()
+            return "аккорд в тишине — не мой"
+        if klav_dubl("host", "аккорд:" + cmd, "down"):
+            return "дубль своего хука"
+        alt_команда(cmd, "Alt с хоста")
+        return "аккорд"
     name = KLAV_IMENA.get(k)
     if name is None:
         return "не моя клавиша"
@@ -945,6 +961,7 @@ _skip = [False]            # правый Alt: оборвать текущую �
 _back = [False]            # двойной правый Alt: вернуться к предыдущей части (03.10)
 _hist = []                 # последние сыгранные части через ВСЕ ответы подряд: (подпись, WAV-байты) — по ним ходит «назад»
 HIST_MAX = 300             # сколько частей помнить (WAV лежат в памяти: ~1,5 МБ на полминуты речи)
+_тексты = {}               # 10.11.2026: id части → текст предложения (баллон «Назад: <первые слова>»)
 _skipmsg = [False]         # правый Alt (а не «.» нампада): пропуск идёт к следующему СООБЩЕНИЮ, а не к следующей части (16.10)
 _cur_msg = [None, 0.0]     # (ключ сообщения (ход, msg), когда оно начало звучать) — для двойного Alt «к началу или к предыдущему»
 _skip_key = [None]         # сообщение, к чьему концу прыгнули Alt-ом, пока его части ещё публикуются: их не играем
@@ -952,31 +969,177 @@ MSG_BACK_SEC = 4.0         # двойной правый Alt: если с нач
 _live_gen = [0]            # номер хода, чей цикл проигрывания сейчас жив (0 — никто не играет и не ждёт частей)
 
 
-# ---- 16.10.2026: проигрывание с позиции и переход по предложениям (нампад) ----
+# ---- 16.10.2026: проигрывание с позиции и переход по предложениям (с 10.11.2026 — аккорды правого Alt) ----
 SENT_BACK_SEC = 1.5         # «назад»: если с начала текущего предложения прошло больше — к началу текущего, иначе к предыдущему
 OUT_DEVICE_FILE = os.path.join(HERE, "out_device")   # необязательно: номер или кусок имени устройства вывода (если звук идёт не туда)
 _paused = [False]           # 16.10.2026: пауза озвучки (Backspace), общая для всех частей
-_nav = [None]               # «prev» / «next» от нампада — забирает цикл проигрывания части
-_np_state = {"remove": None, "held": set(), "ralt": False, "combo_t": 0.0}
+_nav = [None]               # «prev» / «next» от аккордов Alt — забирает цикл проигрывания части
+_np_state = {"combo_t": 0.0}
 # 07.11.2026 (хозяин: на Bluetooth-клавиатуре нет нампада) — те же команды аккордами с правым Alt, пока звучит озвучка:
 # Alt+→ — предыдущее предложение, Alt+← — следующее (так сказал хозяин), Alt+«,» — медленнее, Alt+«.» — быстрее,
 # Alt+«/» — темп к норме. Пауза/продолжить — ОДИНОЧНЫЙ правый Alt во время озвучки (alt_fire; аккорд Alt+↓ хозяин велел убрать).
 # Скан-коды (не зависят от раскладки): → 77, ← 75, «,» 51, «.» 52, «/» 53.
 ALT_CHORDS = {77: "prev", 75: "next", 51: "slower", 52: "faster", 53: "reset"}
+# 10.11.2026 (хозяин: складная Bluetooth-клавиатура без нампада, правого Ctrl и клавиши меню — «всё на правом Alt»):
+# аккорды правого Alt ловит ПОСТОЯННЫЙ блокирующий хук _alt_filter (не только во время озвучки). Он трогает только клавиши
+# из ALT_ВСЕГДА/ALT_ОЗВУЧКА при зажатом правом Alt; всё остальное — True сразу.
+#   ALT_ВСЕГДА (глотаются всегда, работают и в тишине): ↑ (72) — назад (к началу сообщения / в тишине — последнее), Пробел (57) —
+#   пауза/продолжить (и чтобы Alt+Пробел не открывал системное меню окна), M (50) — следующий голос, N (49) — случайный.
+#   ALT_ОЗВУЧКА (только пока звучит озвучка/пауза/ждёт части; в тишине идут в окно как обычно): ↓ (80) — следующее сообщение,
+#   → (77) / ← (75) — предыдущее / следующее предложение, Enter (28) — текущее предложение ещё раз, «,» «.» «/» (51/52/53) — темп.
+# Скан-коды не зависят от раскладки. Одиночный правый Alt (без второй клавиши) — переключатель автоозвучки (alt_fire в main).
+ALT_ВСЕГДА = {72: "back", 57: "pause", 50: "voice_next", 49: "voice_random"}
+ALT_ОЗВУЧКА = {80: "nextmsg", 77: "prevs", 75: "next", 28: "again", 51: "slower", 52: "faster", 53: "reset"}
+VK_RMENU = 0xA5
+_alt_state = {"ralt": False, "held": set()}
+_u32_async = ctypes.WinDLL("user32").GetAsyncKeyState
+_u32_async.argtypes, _u32_async.restype = [ctypes.c_int], ctypes.c_short
+
+
+def озвучка_активна():
+    """Озвучка звучит, стоит на паузе или цикл ответа ждёт следующую часть."""
+    return bool(_playing[0] or _paused[0] or _live_gen[0])
+
+
+def _ralt_зажат():
+    """Правый Alt зажат: по своему флагу хука И по состоянию Windows (флаг мог залипнуть, если отпускание потерялось)."""
+    if not _alt_state["ralt"]:
+        return False
+    try:
+        if not (_u32_async(VK_RMENU) & 0x8000):
+            _alt_state["ralt"] = False
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def alt_команда(cmd, src="Alt"):
+    """Выполнить команду аккорда правого Alt (из своего хука или с хоста Moonlight). Тяжёлое — в отдельном потоке."""
+    _np_state["combo_t"] = time.time()          # одиночный Alt после аккорда — не переключатель автоозвучки
+    log(f"аккорд {src}: {cmd} (играет={'да' if _playing[0] else 'нет'}, цикл={'да' if _live_gen[0] else 'нет'})")
+    if cmd == "back":
+        threading.Thread(target=prev_part, daemon=True).start()
+    elif cmd == "nextmsg":
+        threading.Thread(target=skip_part, daemon=True).start()
+    elif cmd == "voice_next":
+        voice_hotkey("next")
+    elif cmd == "voice_random":
+        voice_hotkey("random")
+    elif cmd == "pause":
+        if _playing[0]:
+            _nav[0] = "pause"
+        else:
+            log("Alt+Пробел: озвучка не идёт — только проглочен")
+    else:                                         # prevs / next / again / slower / faster / reset — забирает цикл проигрывания
+        _nav[0] = cmd
+
+
+_win_held = set()                                        # проглоченные стрелки Win+Alt (скан-коды), ждём их отпускания
+_win_send_until = [0.0]                                  # пока идёт своя отправка ctrl+win+стрелка — хук не реагирует
+
+
+def _win_alt_зажаты():
+    """Зажаты и Win (любой), и Alt (любой, в т.ч. AltGr/скан 541)."""
+    try:
+        win = keyboard.is_pressed("left windows") or keyboard.is_pressed("right windows")
+        alt = (keyboard.is_pressed("alt") or keyboard.is_pressed("right alt") or keyboard.is_pressed("alt gr")
+               or keyboard.is_pressed(541))
+        return bool(win and alt)
+    except Exception:
+        return False
+
+
+def _стол_переключить(сторона):
+    """Win+Alt+←/→ → Ctrl+Win+←/→ (Windows переключает рабочий стол). Alt отпускаем и не возвращаем."""
+    try:
+        _win_send_until[0] = time.time() + 1.0
+        log(f"Win+Alt+{'←' if сторона == 'left' else '→'}: переключаю рабочий стол")
+        for k in ("alt", "right alt", "alt gr"):
+            try:
+                keyboard.release(k)
+            except Exception:
+                pass
+        keyboard.send("ctrl+windows+" + сторона)
+    except Exception as ex:
+        log(f"Win+Alt столы: ошибка {ex}")
+    finally:
+        _win_send_until[0] = time.time() + 0.3
+
+
+def _alt_filter(e):
+    """Постоянный блокирующий хук (10.11.2026): аккорды с зажатым правым Alt. Вызывается на КАЖДОЕ нажатие — только быстрые
+    проверки; без правого Alt — сразу True. Сам Alt пропускается дальше (его одиночное нажатие разбирает on_event)."""
+    try:
+        sc = e.scan_code
+        if sc == 0:
+            return True                                  # клавиша-пустышка
+        if getattr(e, "name", None) in SKIP_KEYS or sc == 541:
+            _alt_state["ralt"] = e.event_type == "down"
+            return True
+        held = _alt_state["held"]
+        if e.event_type != "down":
+            if sc in _win_held:                          # отпускание проглоченной стрелки Win+Alt — тоже глотаем
+                _win_held.discard(sc)
+                return False
+            if sc in held:                               # отпускание проглоченной клавиши аккорда — тоже глотаем
+                held.discard(sc)
+                return False
+            return True
+        if sc in (75, 77) and not getattr(e, "is_keypad", False) and time.time() > _win_send_until[0]:
+            if _win_alt_зажаты():                        # 10.11.2026: Win+Alt+←/→ — переключение рабочих столов Windows
+                _win_held.add(sc)
+                threading.Thread(target=_стол_переключить, args=("left" if sc == 75 else "right",), daemon=True).start()
+                return False
+        if sc not in ALT_ВСЕГДА and sc not in ALT_ОЗВУЧКА:
+            return True
+        if not _ralt_зажат():
+            return True
+        if sc in ALT_ВСЕГДА:
+            cmd = ALT_ВСЕГДА[sc]
+        elif озвучка_активна():
+            cmd = ALT_ОЗВУЧКА[sc]
+        else:
+            return True                                  # в тишине Alt+←/→/Enter/… идут в окно как обычно
+        if sc not in held:                               # автоповтор удержания — одна команда
+            held.add(sc)
+            if not klav_dubl("local", "аккорд:" + cmd, "down"):    # то же нажатие уже пришло с хоста Moonlight
+                alt_команда(cmd)
+            else:
+                _np_state["combo_t"] = time.time()
+        return False
+    except Exception:
+        return True
+
+
+def _first_words(pos, n=5):
+    """Первые слова части _hist[pos] (для баллона «Назад: …»); текста нет — пусто."""
+    try:
+        it = _hist[pos]
+        w = (_тексты.get(it[5]) or "").split() if len(it) > 5 else []
+    except Exception:
+        return ""
+    return " ".join(w[:n]) + ("…" if len(w) > n else "")
+
+
+def _темп_txt(k):
+    return f"{k:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
 _np_lock = threading.Lock()
 _out_dev_logged = [False]
 
 
 def nav_target(marks, t, key):
-    """Куда прыгнуть по клавише нампада. marks — начала предложений (с), t — текущая позиция (с).
+    """Куда прыгнуть по команде аккорда Alt. marks — начала предложений (с), t — текущая позиция (с).
     Возвращает ('seek', секунды) | ('prevpart', None) — назад за начало части | ('nextpart', None) — вперёд за конец части."""
     i = 0
     for k, m in enumerate(marks):
         if m <= t + 0.001:
             i = k
-    if key == "again":                 # 16.10 хозяин: двойной Enter нампада — текущее предложение заново
+    if key == "again":                 # 16.10 хозяин: Alt+Enter — текущее предложение заново
         return ("seek", marks[i])
-    if key == "prev":                  # одиночный Enter — сразу к предыдущему предложению
+    if key in ("prev", "prevs"):       # одиночный Enter (prevs — Alt+→, без ожидания двойного) — к предыдущему предложению
         if t - marks[i] > SENT_BACK_SEC and False:   # прежнее «к началу текущего» отдано двойному нажатию
             return ("seek", marks[i])
         if i > 0:
@@ -987,66 +1150,11 @@ def nav_target(marks, t, key):
     return ("nextpart", None)
 
 
-def _np_filter(e):
-    """Блокирующий хук keyboard (стоит ТОЛЬКО пока звучит озвучка): глотаются и превращаются в команды
-      «.» нампада (скан-код 83 + is_keypad; и при выключенном NumLock) — к следующему предложению, Enter нампада (28 + keypad) — к предыдущему,
-      «0» нампада (скан-код 82, 16.10.2026 хозяин; раньше было Backspace) — пауза/продолжить, «+» нампада (78 + keypad) — темп текущего предложения быстрее,
-      «−» нампада (74 + keypad) — медленнее, «*» нампада (55 + keypad) — темп к норме.
-    ВАЖНО: Backspace нампада и обычный Backspace — один и тот же скан-код 14 (keyboard их не различает), поэтому на время озвучки
-    перехватывается ЛЮБОЙ Backspace, пока звучит озвучка или стоит пауза (хук на паузе остаётся) — стирать текст клавишей Backspace в это
-    время нельзя: сначала правый Ctrl/Alt (стоп) или дослушать. Какие коды шлёт именно нампадный Backspace — видно по строкам «клавиша: …» в журнале.
-    Всё остальное — True (клавиша идёт дальше как обычно). Должен работать мгновенно: вызывается на каждое нажатие."""
-    try:
-        sc, kp = e.scan_code, bool(getattr(e, "is_keypad", False))
-        if sc == 0:
-            return True                              # клавиша-пустышка — мимо
-        held = _np_state["held"]
-        # 07.11.2026: аккорды с правым Alt (ALT_CHORDS) — сам Alt пропускаем дальше, его состояние запоминаем здесь же
-        # (on_event получает события позже и асинхронно); клавишу аккорда глотаем, чтобы Alt+← / Alt+→ не ушли в браузер как «назад/вперёд»
-        if getattr(e, "name", None) in SKIP_KEYS or sc == 541:
-            _np_state["ralt"] = e.event_type == "down"
-            return True
-        if sc in ALT_CHORDS and (_np_state["ralt"] or keyboard.is_pressed("right alt")):
-            k = "alt_" + ALT_CHORDS[sc]
-            if e.event_type == "down":
-                if k not in held:
-                    held.add(k)
-                    _nav[0] = ALT_CHORDS[sc]
-                    _np_state["combo_t"] = time.time()      # одиночный Alt после аккорда не должен прыгать к началу сообщения
-                    log(f"аккорд Alt+{sc} — {ALT_CHORDS[sc]} (озвучка)")
-                return False
-            held.discard(k)
-            return False
-        # 16.10.2026 хозяин: пауза — «0» нампада (скан-код 82 + keypad), не Backspace: тот шлёт один код с обычным и мешал бы стирать
-        if kp:
-            k = {83: "next", 28: "prev", 74: "slower", 78: "faster", 55: "reset", 82: "pause"}.get(sc)
-        else:
-            k = None
-        held = _np_state["held"]
-        # 16.10.2026: журнал нажатий командных клавиш во время озвучки — проверить вживую, шлёт ли нампадный Backspace что-то иное
-        # (только эти скан-коды: остальной набор текста в журнал не попадает)
-        if e.event_type == "down" and sc in (14, 28, 55, 74, 78, 83) and (k is None or k not in held):
-            log(f"клавиша: {getattr(e, 'name', None)}/{sc}/{kp}" + (f" — перехвачена ({k})" if k else " — пропущена"))
-        if k is None:
-            return True
-        if e.event_type == "down":
-            if k not in held:                 # автоповтор удержания — одна команда
-                held.add(k)
-                _nav[0] = k
-            return False
-        if k in held:                         # отпускание той клавиши, нажатие которой мы проглотили
-            held.discard(k)
-            return False
-        return True                           # нажали до включения перехвата — отпускание пропускаем
-    except Exception:
-        return True
-
-
 _np_timer = [None]
 
 
 def _np_off_soon(delay=0.5):
-    """Снять перехват нампада не сразу, а через delay с, если следующая часть не успела его снова взять (между предложениями
+    """Сбросить команду не сразу, а через delay с, если следующая часть не успела его снова взять (между предложениями
     озвучки — доли секунды, хук не переустанавливаем; в настоящей тишине клавиши отпускаются)."""
     def fire(me):
         with _np_lock:
@@ -1064,23 +1172,13 @@ def _np_off_soon(delay=0.5):
 def _np_on():
     with _np_lock:
         _np_timer[0] = None
-        if _np_state["remove"] is None:
-            try:
-                _np_state["held"].clear()
-                _np_state["remove"] = keyboard.hook(_np_filter, suppress=True)
-            except Exception as e:
-                log(f"перехват нампада не включился: {e!r}")
+        # 10.11.2026: перехвата клавиш нампада больше нет (команды — только аккорды правого Alt, их глотает _alt_filter)
+        pass
 
 
 def _np_off():
     with _np_lock:
-        rm, _np_state["remove"] = _np_state["remove"], None
         _nav[0] = None
-        if rm is not None:
-            try:
-                rm()
-            except Exception as e:
-                log(f"перехват нампада не снялся: {e!r}")
 
 
 def _out_device():
@@ -1236,11 +1334,15 @@ def _step(res, pos):
         elapsed = time.time() - _cur_msg[1] if _cur_msg[0] == key else 999
         if first == 0 and elapsed <= MSG_BACK_SEC:
             log("назад: это самое раннее сообщение истории")
+            balloon("Назад: раньше некуда")
             beep((300, 120), (300, 120))                # раньше некуда — писк вместо повтора того же сообщения
             return pos, 0
         if elapsed > MSG_BACK_SEC or first == 0:
+            balloon(f"Назад: {_first_words(first)}".rstrip(": "))
             return _enter_msg(first), 0                 # к началу текущего сообщения
-        return _enter_msg(_msg_start(first - 1)), 0     # к началу предыдущего
+        j = _msg_start(first - 1)
+        balloon(f"Назад: {_first_words(j)}".rstrip(": "))
+        return _enter_msg(j), 0                         # к началу предыдущего
     if res == "nextmsg":
         res = "skip"
     if res == "back":
@@ -1275,6 +1377,7 @@ def skip_part():
         _skipmsg[0] = True             # части нового формата: к первой части следующего сообщения; старые — к следующей части
         _skip[0] = True
         winsound.PlaySound(None, 0)
+        balloon("Следующее сообщение")
         log("правый Alt — к следующему сообщению (старый формат — к следующей части)")
 
 
@@ -1396,8 +1499,8 @@ def _fetch_start(pid, k):
 
 
 def _play_part_msg(item, gen):
-    """Часть-предложение нового формата: sounddevice, нампад под перехватом. «.» — к следующей части, Enter — к предыдущей,
-    двойной Enter за 0,35 с — эта часть заново; «0» нампада — пауза (не Backspace, 16.10); «+»/«−»/«*» — темп ЭТОГО предложения (вариант Gemini с другим
+    """Часть-предложение нового формата: sounddevice. Команды — аккорды правого Alt (нампад убран 10.11.2026): → предыдущая часть, ← следующая,
+    Alt+Enter — эта часть заново, Alt+Пробел — пауза; Alt+«,»/«.»/«/» — темп ЭТОГО предложения (вариант Gemini с другим
     темпом, пока он готовится — тишина, потом играет с начала; темп помнится за предложением). После конца части пауза не
     добавляется (тишина уже в самом WAV), _playing остаётся поднятым до простоя цикла — правый Ctrl/Alt работают и в щели между
     предложениями. Возвращает 'done', 'skip', 'prev', 'nextmsg' (правый Alt), 'back' (двойной правый Alt) или 'stop'."""
@@ -1414,7 +1517,7 @@ def _play_part_msg(item, gen):
         player = _SdPlayer(data)
         player.start()
     except Exception as e:
-        log(f"sounddevice не сыграл ({e!r}) — играю как раньше, без нампада")
+        log(f"sounddevice не сыграл ({e!r}) — играю как раньше, без Alt-аккордов")
         return _play_part_ws(item, gen)
     waiting = False                                     # ждём вариант: оригинал молчит на паузе
     if want != playing:
@@ -1480,22 +1583,34 @@ def _play_part_msg(item, gen):
             if key == "pause":
                 _paused[0] = not _paused[0]
                 player.paused = _paused[0] or waiting
-                log("нампад: «0» — " + ("пауза" if _paused[0] else "продолжаю"))
+                log("Alt+Пробел: " + ("пауза" if _paused[0] else "продолжаю"))
+                balloon("Пауза" if _paused[0] else "Продолжаю")
+                continue
+            if key == "again":                 # 10.11.2026: правый Alt + Enter — это предложение ещё раз
+                if _paused[0]:
+                    _paused[0] = False
+                    player.paused = waiting
+                player.seek(0)
+                _report_clock(pid, player)
+                log("Alt+Enter — предложение ещё раз")
+                balloon("Ещё раз")
                 continue
             if key in ("faster", "slower", "reset"):
                 if not pid:
-                    log("нампад: темп недоступен — у части нет id")
+                    log("темп недоступен — у части нет id")
                     continue
                 cur = _speed.get(pid, 1.0)
                 new = speed_step(cur, key)
                 if new == cur:
-                    log(f"нампад: темп {cur} — {'уже норма' if key == 'reset' else 'край шкалы'}")
+                    log(f"темп {cur} — {'уже норма' if key == 'reset' else 'край шкалы'}")
+                    balloon("Темп: норма" if cur == 1.0 else f"Темп: край {_темп_txt(cur)}")
                     continue
+                balloon("Темп: норма" if new == 1.0 else f"Темп {'↑' if new > cur else '↓'} {_темп_txt(new)}")
                 if new == 1.0:
                     _speed.pop(pid, None)
                 else:
                     _speed[pid] = new
-                log(f"нампад: {dict(faster='«+»', slower='«−»', reset='«*»')[key]} — темп предложения {pid}: {cur} → {new}")
+                log(f"Alt: {dict(faster='быстрее', slower='медленнее', reset='норма')[key]} — темп предложения {pid}: {cur} → {new}")
                 try:
                     if new == playing:
                         waiting = False
@@ -1511,24 +1626,22 @@ def _play_part_msg(item, gen):
                 except Exception as e:
                     log(f"смена темпа: плеер не открылся ({e!r})")
                 continue
-            if key in ("prev", "next") and _paused[0]:   # переход снимает паузу
+            if key in ("prev", "prevs", "next") and _paused[0]:   # переход снимает паузу
                 _paused[0] = False
                 player.paused = waiting
-            if key == "prev":                  # ждём второе нажатие Enter до 0,35 с — двойное = эта часть заново
-                t_end = time.time() + 0.35
-                while time.time() < t_end and _nav[0] != "prev":
-                    time.sleep(0.02)
-                if _nav[0] == "prev":
-                    _nav[0] = None
-                    player.seek(0)
-                    _report_clock(pid, player)
-                    log("нампад: двойной Enter — часть заново")
-                else:
-                    log("нампад: Enter — к предыдущей части")
-                    res = "prev"
-                    break
+            if key == "prevs":                 # 10.11.2026: Alt+→ — сразу к предыдущему предложению, без ожидания двойного
+                log("Alt+→ — к предыдущей части")
+                balloon("Предыдущее предложение")
+                res = "prev"
+                break
+            if key == "prev":                  # 10.11.2026: двойного Enter больше нет (есть Alt+Enter) — сразу назад
+                log("к предыдущей части")
+                balloon("Предыдущее предложение")
+                res = "prev"
+                break
             elif key == "next":
-                log("нампад: «.» — к следующей части")
+                log("Alt+←: к следующей части")
+                balloon("Следующее предложение")
                 res = "skip"
                 break
             time.sleep(0.03)
@@ -1564,24 +1677,25 @@ def _play_part_sd(player, marks, gen, start):
                 res = "skip"
                 break
             key, _nav[0] = _nav[0], None
-            if key == "prev":                  # 16.10: ждём второе нажатие Enter до 0,35 с — двойное = «заново»
-                t_end = time.time() + 0.35
-                while time.time() < t_end and _nav[0] != "prev":
-                    time.sleep(0.02)
-                if _nav[0] == "prev":
-                    _nav[0] = None
-                    key = "again"
+            if key == "pause":                 # 10.11.2026: раньше «пауза» здесь шла как «вперёд» (nav_target её не знает)
+                _paused[0] = not _paused[0]
+                player.paused = _paused[0]
+                balloon("Пауза" if _paused[0] else "Продолжаю")
+                continue
+            if key in ("faster", "slower", "reset"):   # у частей старого формата темпа нет
+                continue
             if key:
+                balloon({"again": "Ещё раз", "next": "Следующее предложение"}.get(key, "Предыдущее предложение"))
                 kind, sec = nav_target(marks, player.now(), key)
                 if kind == "seek":
                     player.seek(sec)
-                    log(f"нампад: {dict(prev='назад', next='вперёд', again='заново').get(key, key)} — к {sec:.1f} с")
+                    log(f"{dict(prev='назад', next='вперёд', again='заново').get(key, key)} — к {sec:.1f} с")
                 elif kind == "prevpart":
-                    log("нампад: назад — к предыдущей части")
+                    log("назад — к предыдущей части")
                     res = "prev"
                     break
                 else:
-                    log("нампад: вперёд — к следующей части")
+                    log("вперёд — к следующей части")
                     res = "skip"
                     break
             time.sleep(0.03)
@@ -1692,10 +1806,12 @@ def replay_tail():
         новых = добрать_свежее()
         if not _hist:
             log("назад — повторять нечего")
+            balloon("Назад: повторять нечего")
             return
         log(f"назад — непрозвучавший ответ, частей: {новых}" if новых else "назад — повтор последней части ответа")
         _skip_key[0] = None
         pos = _tail_pos(новых)
+        balloon(f"Назад: {_first_words(pos)}".rstrip(": "))
         start = 0
         last_item = None
         while True:
@@ -1803,7 +1919,8 @@ def _hist_persist(p, data):
                 with open(fn + ".tmp", "wb") as f:
                     f.write(data)
                 os.replace(fn + ".tmp", fn)
-            idx = [[it[0], it[5], it[2], list(it[3]) if it[3] else None, it[4], _hist_ts.get(it[5], 0), it[6] if len(it) > 6 else None]
+            idx = [[it[0], it[5], it[2], list(it[3]) if it[3] else None, it[4], _hist_ts.get(it[5], 0), it[6] if len(it) > 6 else None,
+                    _тексты.get(it[5], "")]
                    for it in _hist if len(it) > 5 and it[5]]
             with open(os.path.join(HIST_DIR, "индекс.json.tmp"), "w", encoding="utf-8") as f:
                 json.dump(idx[-HIST_MAX:], f, ensure_ascii=False)
@@ -1833,6 +1950,8 @@ def _hist_load():
     for row in idx:
         seq, pid, marks, key, sent, ts = row[:6]
         ord_ = row[6] if len(row) > 6 else None
+        if len(row) > 7 and row[7]:
+            _тексты[pid] = row[7]
         try:
             with open(os.path.join(HIST_DIR, f"{pid}.wav"), "rb") as f:
                 data = f.read()
@@ -1851,6 +1970,10 @@ def _hist_load():
 def _item(p, data, meta):
     """Запись истории: (seq, WAV, marks, ключ сообщения (ход, msg) или None для старого формата, номер предложения, id части)."""
     key = (meta.get("turn"), p["msg"]) if p.get("msg") is not None else None
+    if p.get("id") and p.get("text"):
+        _тексты[p["id"]] = str(p["text"])[:200]
+        while len(_тексты) > 2 * HIST_MAX:
+            _тексты.pop(next(iter(_тексты)))
     return (p.get("seq", 1), data, p.get("marks"), key, p.get("sent"), p.get("id"), p.get("ord"))
 
 
@@ -1925,13 +2048,24 @@ def _report_clock(pid, player):
 
 
 def _pos_sender():
+    """10.11.2026: поток умирал молча (с 18:17 «место → сервер» не уходило, дом не готовил следующие предложения — «читает
+    только первое»). Теперь любая ошибка тела цикла пишется в журнал, поток живёт дальше."""
     while True:
+        try:
+            _pos_sender_шаг()
+        except Exception as e:
+            log(f"_pos_sender: {e!r}")
+            time.sleep(1)
+
+
+def _pos_sender_шаг():
+    if True:
         _pos_ev.wait()
         _pos_ev.clear()
         time.sleep(POS_DEBOUNCE_CLK if (_pos_slot[0] or (0, 0))[1] == "clk" else POS_DEBOUNCE_SEC)
         v = _pos_slot[0]
         if not v:
-            continue
+            return
         # input_text один на темп и место: пока готовится вариант темпа (запрос только что ушёл), своё место не шлём поверх него
         t0 = time.time()
         while (_var_busy or time.time() - _speed_hook_t[0] < 1.6) and time.time() - t0 < 6:
@@ -1997,13 +2131,64 @@ def автоозвучка():
         return False
 
 
+ФРАЗЫ_URL = f"http://{HOST}:8123/local/voice_frazy/"   # служебные фразы, Silero (/config/.local/bin/озвучка_фразы.py в Студии)
+
+
+def фраза(имя):
+    """Сыграть служебную фразу (WAV с дома, копия рядом со скриптом). Нет файла и сети — False."""
+    путь = os.path.join(HERE, f"фраза_{имя}.wav")
+    try:
+        if not os.path.exists(путь):
+            with urllib.request.urlopen(ФРАЗЫ_URL + имя + ".wav", timeout=5) as r:
+                data = r.read()
+            with open(путь + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(путь + ".tmp", путь)
+        winsound.PlaySound(путь, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        return True
+    except Exception as e:
+        log(f"фраза {имя} не сыграла: {e!r}")
+        return False
+
+
+def переключить_автоозвучку():
+    """10.11.2026 хозяин: одиночный правый Alt — переключатель автоозвучки новых сообщений (тот же файл автоозвучка.txt).
+    Выключение обрывает текущую озвучку. Реплика «озвучка включена/выключена» — голосом Silero, как служебные ответы."""
+    вкл = not автоозвучка()
+    try:
+        with open(АВТО_ФАЙЛ, "w", encoding="utf-8") as f:
+            f.write("вкл" if вкл else "выкл")
+    except OSError as e:
+        log(f"автоозвучка: файл не записан {e!r}")
+        balloon("Озвучка: ошибка")
+        beep((300, 200))
+        return
+    if not вкл:
+        _reply_gen[0] += 1               # оборвать и игру, и ожидание следующих частей (в т.ч. на паузе)
+        _paused[0] = False
+        _playing[0] = False
+        winsound.PlaySound(None, 0)
+    balloon("Озвучка: вкл — читаю последнее" if вкл else "Озвучка: выкл")
+    log(f"правый Alt одиночный → автоозвучка {'ВКЛ' if вкл else 'ВЫКЛ'}")     # строка уходит и в журнал озвучки дома
+    time.sleep(0.3)                      # дать плееру закрыться — фраза не должна смешаться с оборванной частью
+    if not фраза("ozvuchka_vkl" if вкл else "ozvuchka_vykl"):
+        beep((900, 60), (1200, 60)) if вкл else beep((1200, 60), (900, 60))
+    if вкл:
+        # 10.11.2026 хозяин: включил — сразу читать последнее сообщение чата с первого предложения (как Alt+↑ в тишине:
+        # replay_tail берёт непрозвучавшее или начало последнего сообщения). bg_loop при включении помечает лежащие ходы
+        # проигранными, чтобы они не сыграли второй раз поверх этого повтора.
+        time.sleep(1.6)                  # фраза «Озвучка включена» (~1,5 с, SND_ASYNC) — не перебивать
+        if автоозвучка():                # за это время могли выключить обратно
+            threading.Thread(target=replay_tail, daemon=True).start()
+
+
 def ответ_голосом(text, t_sent, фразы=None):
     """Запуск ожидания ответа голосом — только при включённой автоозвучке; иначе пометить фразу и ждать Alt."""
     if автоозвучка():
         threading.Thread(target=speak_reply, args=(text, t_sent, фразы), daemon=True).start()
     else:
         mark_voice(text)
-        log("автоозвучка выкл — ответ прозвучит по правому Alt")
+        log("автоозвучка выкл — ответ прозвучит по правому Alt+↑")
 
 
 def bg_loop():
@@ -2012,6 +2197,7 @@ def bg_loop():
     как ответ на фразу, но в очередь: пока звучит или ждёт частей ответ на фразу хозяина (_live_gen), не трогаем. Правый Ctrl
     во время звучания обрывает и остальной ход (он попадает в _bg_done и повторно не играется)."""
     first = True
+    было_вкл = [автоозвучка()]
     while True:
         time.sleep(1.5)
         try:
@@ -2026,9 +2212,15 @@ def bg_loop():
                 if t.get("turn"):
                     _bg_done.add(t["turn"])
             continue
+        вкл = автоозвучка()
+        if вкл and not было_вкл[0]:        # 10.11.2026: автоозвучку только что включили — старое из ленты не играем, только новое
+            for t in ходы:
+                if t.get("turn"):
+                    _bg_done.add(t["turn"])
+        было_вкл[0] = вкл
         if _live_gen[0]:
             continue
-        if not автоозвучка():              # 07.11.2026: без автоозвучки ходы от уведомлений не играют — только в историю для Alt
+        if not вкл:                        # 07.11.2026: без автоозвучки ходы от уведомлений не играют — только в историю для Alt
             try:
                 добрать_свежее()
             except Exception as e:
@@ -2582,6 +2774,17 @@ class Voice:
             on_enter()
 
 
+GOLOS_URL = f"http://{HOST}:8123/local/" + urllib.parse.quote("живое") + "/golos.json"
+
+
+def _golos_json():
+    try:
+        with urllib.request.urlopen(GOLOS_URL + "?_=%d" % (time.time() * 1000), timeout=3) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
 def voice_hotkey(action):
     """Горячая клавиша голоса Алёны (30.09.2026, по образцу правых Ctrl/Alt): короткое нажатие одного правого Shift —
     следующий голос Gemini по списку, двойное (два нажатия за 0,4 с) — режим «Случайный» (новый голос на каждый ответ). Вебхук HA alena_golos_hotkey → input_select.golos_alyony →
@@ -2591,10 +2794,23 @@ def voice_hotkey(action):
             req = urllib.request.Request(f"http://{HOST}:8123/api/webhook/alena_golos_hotkey", method="POST",
                                          data=json.dumps({"action": action}).encode("utf-8"),
                                          headers={"Content-Type": "application/json"})
+            g0 = _golos_json() or {}
             urllib.request.urlopen(req, timeout=5).read()
             beep((900, 50), (1100, 50)) if action == "next" else beep((1100, 40), (800, 40), (1100, 40))
-            balloon("🎙 голос: " + ("следующий" if action == "next" else "случайный"))
-            log(f"горячая клавиша голоса: {action}")
+            # 10.11.2026: баллон с именем голоса — голос_выбор.py (shell_command дома) кладёт его в /local/живое/golos.json
+            имя = ""
+            if action == "next":
+                for _ in range(12):
+                    time.sleep(0.4)
+                    g = _golos_json()
+                    if g is not None and g.get("t") != g0.get("t"):      # файл переписан после нажатия (часы XPS не сверяем)
+                        имя = str(g.get("voice") or "")
+                        break
+            if action == "random" or имя == "random":
+                balloon("Голос: случайный")
+            else:
+                balloon(f"Голос: {имя}" if имя else "Голос: следующий")
+            log(f"горячая клавиша голоса: {action}" + (f" → {имя}" if имя else ""))
         except Exception as e:
             log(f"горячая клавиша голоса не сработала: {e!r}")
             beep((300, 200))
@@ -2620,14 +2836,10 @@ def main():
         voice_hotkey("next")
 
     def alt_fire():
+        # 10.11.2026 хозяин («всё на правом Alt»): одиночный правый Alt — переключатель автоозвучки новых сообщений.
+        # Было (07.11): во время озвучки — пауза (теперь Alt+Пробел), в тишине — назад/последнее (теперь Alt+↑).
         alt["timer"] = None
-        if _playing[0]:
-            # 07.11.2026 хозяин: «Alt в процессе озвучки не запускает сначала, а ставит на паузу» (и снимает её)
-            _nav[0] = "pause"
-            log(f"правый Alt одиночный → {'продолжить' if _paused[0] else 'пауза'} (озвучка идёт)")
-            return
-        log(f"правый Alt одиночный → назад (цикл={'да' if _live_gen[0] else 'нет'}, играет={'да' if _playing[0] else 'нет'}, частей в истории {len(_hist)})")
-        prev_part()      # 16.10.2026 хозяин поменял: одиночный правый Alt — назад (к началу текущего/предыдущего сообщения)
+        переключить_автоозвучку()
 
     _sl_stat = {"t": 0.0, "n": 0}     # 07.11.2026 вечер: счётчик событий Scroll Lock (скан 70) — они срывали записи
 
@@ -2651,7 +2863,7 @@ def main():
             e.name = "right alt"
         if e.event_type == "down":
             v.last_key = time.time()
-        if e.name == VOICE_KEY:
+        if VOICE_KEY and e.name == VOICE_KEY:
             if e.event_type == "down":
                 if not rsh["down"]:
                     rsh.update(down=True, other=False)
@@ -2685,7 +2897,7 @@ def main():
             else:
                 if alt["down"] and not alt["other"] and _np_state["combo_t"] < alt.get("t", 0.0):
                     # 06.11.2026 хозяин: «вперёд» (был двойной Alt) — на клавише контекстного меню, поэтому одиночный Alt
-                    # срабатывает сразу, без ожидания второго нажатия. 07.11: после аккорда Alt+клавиша (проглочен в _np_filter) — не прыгать
+                    # срабатывает сразу, без ожидания второго нажатия. 07.11: после аккорда Alt+клавиша (проглочен в _alt_filter) — не прыгать
                     alt["last"] = time.time()
                     threading.Thread(target=alt_fire, daemon=True).start()
                 alt["down"] = False
@@ -2723,27 +2935,21 @@ def main():
     threading.Thread(target=klav_server, daemon=True).start()
     threading.Thread(target=bg_loop, daemon=True).start()
     threading.Thread(target=_pos_sender, daemon=True).start()     # 04.11.2026: играющее место — серверу озвучки
+    try:     # 10.11.2026: постоянный хук аккордов правого Alt — раньше хука нампада, чтобы аккорды доставались ему
+        keyboard.hook(_alt_filter, suppress=True)
+        log("аккорды правого Alt: хук стоит")
+    except Exception as e:
+        log(f"аккорды правого Alt: хук не встал {e!r}")
     keyboard.hook(on_local)
 
-    # 06.11.2026 хозяин: клавиша контекстного меню (между правыми Alt и Ctrl) — озвучка вперёд, к следующему сообщению
-    # (раньше — двойной правый Alt). Клавиша глушится всегда: контекстное меню ею не открывается.
-    menu_held = [False]
-
-    def on_menu(e):
-        if e.event_type == "down":
-            if not menu_held[0]:              # автоповтор удержания — одна команда
-                menu_held[0] = True
-                log(f"клавиша меню → вперёд (играет={'да' if _playing[0] else 'нет'})")
-                threading.Thread(target=skip_part, daemon=True).start()
-        else:
-            menu_held[0] = False
-        return False
-
-    try:
-        keyboard.hook_key("applications", on_menu, suppress=True)
-    except Exception as e:
-        log(f"клавиша меню не перехвачена: {e!r}")
-    log(f"запущено: {HOTKEY} — диктовка (и оборвать ответ), {VOICE_KEY} — следующий голос, двойной — случайный; правый Alt — назад к началу сообщения (окно 4 с), в тишине — последнее; клавиша меню — вперёд, к следующему сообщению; нампад «.» — следующее предложение, Enter — предыдущее, двойной Enter — заново, «0» — пауза, «+»/«−» — темп предложения, «*» — норма, пока звучит ответ; «Алёна, …» — фраза в активное окно (в VS Code с Enter)")
+    # 06.11.2026 клавиша контекстного меню была «вперёд»; с 10.11.2026 снята (см. ниже)
+    # 10.11.2026 (хозяин): клавиша меню больше не перехватывается (следующее сообщение — Alt+↓), работает как системная
+    log(f"запущено: {HOTKEY} (держать) — диктовка (и оборвать ответ); правый Alt одиночный — автоозвучка вкл/выкл "
+        f"(сейчас {'вкл' if автоозвучка() else 'выкл'}); Alt+Пробел — пауза/продолжить; Alt+↓ — следующее сообщение; "
+        f"Alt+↑ — назад к началу сообщения (окно 4 с), в тишине — последнее; Alt+→/← — предыдущее/следующее предложение; "
+        f"Alt+Enter — предложение ещё раз; Alt+«,»/«.»/«/» — темп медленнее/быстрее/норма; Alt+M — следующий голос, Alt+N — случайный. "
+        f"Дублей нет: нампад, правый Ctrl и клавиша меню с 10.11.2026 не используются; "
+        f"«Алёна, …» — фраза в активное окно (в VS Code с Enter)")
     keyboard.wait()
 
 
