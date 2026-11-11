@@ -55,6 +55,8 @@ HOTKEY = "right shift"
 VOICE_KEY = None
 SKIP_KEYS = ("right alt", "alt gr")   # правый Alt: одиночный — автоозвучка вкл/выкл, аккорды — _alt_filter (10.11.2026)
 MIN_SEC = 0.3
+ОТПУСК_МС = 150   # 11.11.2026: дребезг клавиши диктовки — отпускание короче этого с новым нажатием не считается
+_отпуск = {"таймер": None, "t": 0.0}
 LOG = os.path.join(HERE, "dictate.log")
 NO_WAKE = os.path.join(HERE, "no_wake")
 DEBUG = os.path.exists(os.path.join(HERE, "debug_wake"))   # подробный лог Vosk: создать файл debug_wake
@@ -2927,16 +2929,36 @@ def main():
             elif _armed["text"]:
                 on_enter()
         if e.name == HOTKEY:
+            # 11.11.2026 хозяин: «всё-таки подтормаживает диктовка». Журнал: нажатие приходит дребезгом — down → up через
+            # ~0 мс → снова down; запись начиналась, тут же отменялась («0.0 с, короче 0.3 с») и начиналась заново, на старте
+            # звучали две мелодии. Отпускание теперь считается настоящим, только если за ОТПУСК_МС клавиша не нажалась снова.
             if e.event_type == "down":
+                т = _отпуск["таймер"]
+                if т is not None:
+                    т.cancel()
+                    _отпуск["таймер"] = None
+                    if v.rec:
+                        log(f"дребезг клавиши: отпускание {1000 * (time.time() - _отпуск['t']):.0f} мс — запись продолжается")
+                        return
                 stop_reply()
                 v.key_start()
             else:
-                v.key_stop()
+                _отпуск["t"] = time.time()
+                т = threading.Timer(ОТПУСК_МС / 1000, _отпустить)
+                _отпуск["таймер"] = т
+                т.start()
         elif e.event_type == "down" and v.rec:
             v.cancelled = True
             v.cancel_key = (e.name, getattr(e, "scan_code", None))
 
     zamok = threading.Lock()     # свой хук и клавиши с хоста Moonlight приходят из разных потоков
+
+    def _отпустить():
+        with zamok:
+            if _отпуск["таймер"] is None:
+                return
+            _отпуск["таймер"] = None
+            v.key_stop()
 
     def on_local(e):
         if klav_dubl("local", getattr(e, "name", None), e.event_type):
