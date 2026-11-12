@@ -2055,7 +2055,40 @@ def _report_pos(pid, kind, n=None):
             log(f"место не сообщено: у играющей части пустой id ({kind} {n})")
         return
     _pos_slot[0] = (pid, kind, n)
+    if not _pos_ev.is_set():
+        _pos_ev_t[0] = time.time()
     _pos_ev.set()
+
+
+# 12.11.2026: третий раз «озвучка читает только первое предложение» (10.11 18:17, 11.11 19:07, 11.11 20:47) — поток места
+# замолкал без исключения и без «пустого id», хотя ответы играли (повис, а не упал). Сторож: событие «место изменилось» не
+# забрано дольше POS_СТОРОЖ_С — в журнал стек зависшего потока (причина на будущее) и новый поток места.
+_pos_ev_t = [0.0]
+_pos_thr = [None]
+POS_СТОРОЖ_С = 20
+
+
+def _pos_start():
+    _pos_thr[0] = threading.Thread(target=_pos_sender, daemon=True, name="pos_sender")
+    _pos_thr[0].start()
+
+
+def _pos_сторож():
+    import traceback
+    while True:
+        time.sleep(5)
+        try:
+            if _pos_ev.is_set() and time.time() - _pos_ev_t[0] > POS_СТОРОЖ_С:
+                thr = _pos_thr[0]
+                стек = ""
+                if thr is not None and thr.ident in sys._current_frames():
+                    стек = " | ".join(l.strip() for l in traceback.format_stack(sys._current_frames()[thr.ident])[-6:])
+                log(f"_pos_sender завис ({'жив' if thr and thr.is_alive() else 'мёртв'}) {time.time() - _pos_ev_t[0]:.0f} с — "
+                    f"новый поток; стек: {стек[:900]}")
+                _pos_ev_t[0] = time.time()
+                _pos_start()
+        except Exception as e:
+            log(f"_pos_сторож: {e!r}")
 
 
 def _report_clock(pid, player):
@@ -2981,7 +3014,8 @@ def main():
     _vnesh["obrabotchik"] = on_host
     threading.Thread(target=klav_server, daemon=True).start()
     threading.Thread(target=bg_loop, daemon=True).start()
-    threading.Thread(target=_pos_sender, daemon=True).start()     # 04.11.2026: играющее место — серверу озвучки
+    _pos_start()     # 04.11.2026: играющее место — серверу озвучки
+    threading.Thread(target=_pos_сторож, daemon=True, name="pos_storozh").start()   # 12.11.2026: сторож потока места
     try:     # 10.11.2026: постоянный хук аккордов правого Alt — раньше хука нампада, чтобы аккорды доставались ему
         keyboard.hook(_alt_filter, suppress=True)
         log("аккорды правого Alt: хук стоит")
