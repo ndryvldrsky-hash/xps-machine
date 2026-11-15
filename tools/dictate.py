@@ -789,7 +789,8 @@ def вставить(text):
 # Moonlight не передаёт на хост ни Юникод-события, ни буфер обмена: Ctrl+V из вставить() уходил на Кузницу и вставлял
 # ЕЁ буфер, а не фразу. Если впереди окно потока «<хост> - Moonlight», фраза уходит приёмнику на самом хосте
 # (kuznitsa/diktovka/diktovka_priem.py, служба diktovka-priem у alena), он вставляет её в активное окно там.
-MOONLIGHT_HOSTS = {"kuznitsa": "192.168.77.62"}   # имя хоста в заголовке окна Moonlight → адрес приёмника
+# 15.11.2026: + kupala — стол Нукса на панели XPS (приёмник diktovka-priem-kupala на Нуксе, :117); адреса — именами .lan
+MOONLIGHT_HOSTS = {"kuznitsa": "kuznitsa.lan", "kupala": "nuks.lan"}   # имя хоста в заголовке окна Moonlight → адрес приёмника
 MOONLIGHT_PORT = 10320
 MOONLIGHT_TOKEN_FILE = os.path.join(HERE, "kuznitsa_token")
 
