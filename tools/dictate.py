@@ -637,10 +637,14 @@ _u32.keybd_event.restype = None
 DUMMY_VK = 0xE8    # незанятый виртуальный код: клавиша-пустышка, скан-код 0
 
 
+_пустышка_t = [0.0]
+
+
 def пустышка():
     """07.11.2026 (хозяин: «при нажатии на Alt… фокус уходит из поля»): одиночный Alt в Windows переводит фокус в меню окна
     (в браузере — на кнопку меню). Пока правый Alt зажат, «нажимаем» пустую клавишу — Windows считает, что было сочетание,
     и фокус не трогает (так же делает AutoHotkey: Send {Blind}{vk07}). Свои хуки это событие узнают по скан-коду 0 и пропускают."""
+    _пустышка_t[0] = time.time()
     try:
         _u32.keybd_event(DUMMY_VK, 0, 0, None)
         _u32.keybd_event(DUMMY_VK, 0, 2, None)      # KEYEVENTF_KEYUP
@@ -879,6 +883,10 @@ def klav_vneshnyaya(sob):
             return "дубль своего хука"
         alt_команда(cmd, "Alt с хоста")
         return "аккорд"
+    # 16.11.2026: пустышка (см. пустышка()) уходит через Moonlight на хост и возвращается оттуда «прочей клавишей» —
+    # одиночный правый Alt в окне Купалы считался сочетанием и через раз не срабатывал
+    if k == "other" and time.time() - _пустышка_t[0] < 0.5:
+        return "своя пустышка с хоста"
     name = KLAV_IMENA.get(k)
     if name is None:
         return "не моя клавиша"
@@ -3003,7 +3011,10 @@ def main():
             v.key_stop()
 
     def on_local(e):
-        if klav_dubl("local", getattr(e, "name", None), e.event_type):
+        имя = getattr(e, "name", None)
+        if getattr(e, "scan_code", None) == 541:   # 15.11.2026: AltGr своего хука зовётся 'ctrl'/'alt gr' — сверять с хостом как правый Alt
+            имя = "right alt"
+        if klav_dubl("local", имя, e.event_type):
             return
         with zamok:
             on_event(e)
