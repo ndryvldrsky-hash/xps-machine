@@ -4,8 +4,10 @@
 # Зачем. Штатная плавающая языковая панель Windows светлая, её не найти глазами, и она
 # прыгает при смене рабочих столов. Хозяин: «чтоб можно было увидеть, что там за ней»
 # (про полупрозрачность плашки) и попросил сразу три вида индикации:
-#   1. Плашка над кнопкой «Пуск» на КАЖДОМ мониторе (полупрозрачная, альфа ~0.7);
-#   2. Маленькая цветная буква у текстовой каретки (нет каретки - у указателя мыши);
+#   1. Плашка у кнопки «Пуск» на КАЖДОМ мониторе (полупрозрачная, альфа ~0.7); с 17.11 — слева от «Пуска»,
+#      а левее неё квадрат «Д» — статус диктовки (оранжевый — работает, серый — нет пульса status.json);
+#   2. Маленькая цветная буква у текстовой каретки (нет каретки - у указателя мыши); с 17.11 — слева-снизу,
+#      догоняет медленнее (FOLLOW);
 #   3. Вспышка крупными буквами по центру монитора активного окна при смене раскладки.
 # Цвета: RU красный #D32F2F, EN синий #1565C0, HE зелёный #2E7D32, остальное - код серым.
 #
@@ -77,6 +79,13 @@ SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE, SWP_SHOWWINDOW = 0x1, 0x2, 0x10, 0x40
 COLORS = {0x0419: "#D32F2F", 0x0409: "#1565C0", 0x040D: "#2E7D32"}
 NAMES = {0x0419: "RU", 0x0409: "EN", 0x040D: "HE"}
 GRAY = "#6E6E6E"
+CARET_W = 22          # ширина метки у курсора
+FOLLOW = 0.12         # 17.11.2026: метка догоняет курсор медленнее (было 0.4 за шаг 25 мс)
+# 17.11.2026 хозяин: «за ним ещё показать статус диктовки: включена или выключена таким же квадратиком, только с другим
+# цветом». Включена = программа диктовки жива: её пульс status.json обновляется раз в 30 с.
+DICT_STATUS = r"W:\Tools\dictate\status.json"
+DICT_ALIVE_SEC = 90
+DICT_ON = "#EF6C00"   # оранжевый — не путается с RU красным, EN синим, HE зелёным
 
 
 class RECT(ctypes.Structure):
@@ -296,6 +305,9 @@ class App:
         self.root = tk.Tk()
         self.root.withdraw()
         self.plates = {}       # монитор -> overlay
+        self.dplates = {}      # монитор -> квадрат статуса диктовки (17.11.2026)
+        self.dict_on = False
+        self.t_dict = 0
         self.mons = monitors()
         self.caret = make_overlay(self.root, "", 14, 0.75)
         self.flash = make_overlay(self.root, "", 90, 0.0)
@@ -320,11 +332,22 @@ class App:
                 except Exception:
                     pass
                 del self.plates[m]
+        for m in list(self.dplates):
+            if m not in mons:
+                try:
+                    self.dplates[m]["w"].destroy()
+                except Exception:
+                    pass
+                del self.dplates[m]
         text, color = label_for(self.lid)
+        dcolor = DICT_ON if self.dict_on else GRAY
         for m in mons:
             o = self.plates.get(m)
             if o is None:
                 o = self.plates[m] = make_overlay(self.root, text, 14, 0.7)
+            d = self.dplates.get(m)
+            if d is None:
+                d = self.dplates[m] = make_overlay(self.root, "Д", 14, 0.7)
             rect = START.get(m)
             if rect is None:
                 # Пока UIA не ответил: примерно по центру низа монитора (Win11)
@@ -334,16 +357,34 @@ class App:
             l, t, r, b = rect
             w = max(r - l, 30)
             h = max(int(w * 0.5), 20)
-            # панель наверху экрана (середина кнопки в верхней половине) - плашка под кнопкой
-            if (t + b) // 2 < (m[1] + m[3]) // 2:
-                y = b + 2
-            else:
-                y = t - h - 2
+            # 17.11.2026 хозяин: «сделать его слева от кнопки пуск. И за ним ещё показать статус диктовки» —
+            # было над кнопкой; теперь на уровне кнопки слева от неё, левее — квадрат диктовки того же размера
+            y = t + (b - t - h) // 2
+            x = l - w - 4
             paint(o, text, color)
             set_font(o, h * 0.62)
-            nxt = (l, y, w, h)
+            nxt = (x, y, w, h)
             if o["pos"] != nxt:
                 place(o, *nxt)
+            paint(d, "Д", dcolor)
+            set_font(d, h * 0.62)
+            dn = (x - w - 4, y, w, h)
+            if d["pos"] != dn:
+                place(d, *dn)
+
+    # --- статус диктовки (пульс status.json) ---
+    def read_dict(self):
+        on = False
+        try:
+            import json, datetime
+            with open(DICT_STATUS, encoding="utf-8") as f:
+                t = datetime.datetime.fromisoformat(json.load(f)["t"])
+            on = (datetime.datetime.now() - t).total_seconds() < DICT_ALIVE_SEC
+        except Exception:
+            on = False
+        if on != self.dict_on:
+            self.dict_on = on
+            self.update_plates()
 
     # --- метка у каретки / мыши ---
     def follow(self):
@@ -359,16 +400,18 @@ class App:
                     pt = POINT(rc.left, rc.bottom)
                     if user32.ClientToScreen(ctypes.c_void_p(gi.hwndCaret), ctypes.byref(pt)):
                         if pt.x or pt.y:
-                            tx, ty = pt.x + 4, pt.y + 2
+                            tx, ty = pt.x - 4 - CARET_W, pt.y + 2   # 17.11: слева-снизу от каретки, как у мыши
         if tx is None:
             pt = POINT()
             user32.GetCursorPos(ctypes.byref(pt))
-            tx, ty = pt.x + 18, pt.y + 18
+            # 17.11.2026 хозяин: «внизу, но только с левой стороны от мышки» (было справа-снизу: +18, +18)
+            tx, ty = pt.x - 18 - CARET_W, pt.y + 18
         if self.cx is None or abs(tx - self.cx) > 600 or abs(ty - self.cy) > 600:
             self.cx, self.cy = tx, ty
         else:
-            self.cx += (tx - self.cx) * 0.4
-            self.cy += (ty - self.cy) * 0.4
+            # 17.11.2026: «чтобы он медленнее возвращался к мышке» — доля пути за шаг 25 мс 0.4 → FOLLOW
+            self.cx += (tx - self.cx) * FOLLOW
+            self.cy += (ty - self.cy) * FOLLOW
         move_only(self.caret, self.cx, self.cy)
 
     # --- вспышка ---
@@ -430,8 +473,11 @@ class App:
                 reassert(self.caret)
                 if self.flash_t0 is not None:
                     reassert(self.flash)
-                for o in self.plates.values():
+                for o in list(self.plates.values()) + list(self.dplates.values()):
                     reassert(o)
+            if now - self.t_dict >= 2.0:
+                self.t_dict = now
+                self.read_dict()
             self.follow()
             self.step_flash()
         except Exception:
