@@ -939,6 +939,12 @@ def klav_server():
                 ip_ok = any(ipaddress.ip_address(self.client_address[0]) in s for s in seti)
             except ValueError:
                 ip_ok = False
+            if self.path == "/balloon" and self.client_address[0] == "127.0.0.1":   # 19.11.2026: подсказки нового плеера
+                try:
+                    balloon(str(json.loads(body.decode("utf-8")).get("text", ""))[:80])
+                except Exception:
+                    pass
+                return self._otvet(200, {"ok": True})
             if self.path != "/klavisha" or not ip_ok:
                 return self._otvet(404, {"ok": False})
             try:
@@ -1024,8 +1030,54 @@ _u32_async = ctypes.WinDLL("user32").GetAsyncKeyState
 _u32_async.argtypes, _u32_async.restype = [ctypes.c_int], ctypes.c_short
 
 
+# ---- 19.11.2026: вариант В, шаг 4 — новый плеер отдельным процессом (W:\Tools\pleer\плеер.py, задача AlenaPleer) -----------
+# Файл W:\Tools\pleer\плеер_режим.txt = «новый» — играет плеер, а здесь: speak_reply/bg_loop молчат, клавиши озвучки уходят
+# плееру POST 127.0.0.1:10322/komanda из своего потока (в хуке сети нет). Откат — «старый» (без перезаливки). План: план_В.md.
+ПЛЕЕР_РЕЖИМ = r"W:\Tools\pleer\плеер_режим.txt"
+ПЛЕЕР_АКТИВНА = r"W:\Tools\pleer\активна"
+_плеер_кэш = [0.0, False]
+_плеер_очередь = queue.Queue()
+
+
+def новый_плеер():
+    """Режим из файла, перечитывается не чаще раза в секунду (зовётся и из хука клавиш)."""
+    if time.time() - _плеер_кэш[0] > 1.0:
+        _плеер_кэш[0] = time.time()
+        try:
+            with open(ПЛЕЕР_РЕЖИМ, encoding="utf-8") as f:
+                _плеер_кэш[1] = f.read().strip().lower().startswith("нов")
+        except OSError:
+            _плеер_кэш[1] = False
+    return _плеер_кэш[1]
+
+
+def плееру(к):
+    _плеер_очередь.put(к)
+
+
+def _плеер_отправщик():
+    while True:
+        к = _плеер_очередь.get()
+        try:
+            req = urllib.request.Request("http://127.0.0.1:10322/komanda", method="POST",
+                                         data=json.dumps({"вид": "клавиша", "к": к}, ensure_ascii=False).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=0.5).read()
+            log(f"плееру: {к}")
+        except Exception as e:
+            log(f"плееру не отправлено {к}: {e!r}")
+
+
+threading.Thread(target=_плеер_отправщик, daemon=True).start()
+
+
 def озвучка_активна():
     """Озвучка звучит, стоит на паузе или цикл ответа ждёт следующую часть."""
+    if новый_плеер():                 # 19.11.2026: плеер пишет время в файл, пока играет/пауза/ждёт звук
+        try:
+            return time.time() - os.path.getmtime(ПЛЕЕР_АКТИВНА) < 1.5
+        except OSError:
+            return False
     return bool(_playing[0] or _paused[0] or _live_gen[0])
 
 
@@ -1046,6 +1098,9 @@ def alt_команда(cmd, src="Alt"):
     """Выполнить команду аккорда правого Alt (из своего хука или с хоста Moonlight). Тяжёлое — в отдельном потоке."""
     _np_state["combo_t"] = time.time()          # одиночный Alt после аккорда — не переключатель автоозвучки
     log(f"аккорд {src}: {cmd} (играет={'да' if _playing[0] else 'нет'}, цикл={'да' if _live_gen[0] else 'нет'})")
+    if новый_плеер() and cmd not in ("voice_next", "voice_random"):
+        плееру(cmd)
+        return
     if cmd == "back":
         threading.Thread(target=prev_part, daemon=True).start()
     elif cmd == "nextmsg":
@@ -1391,6 +1446,10 @@ def _tail_pos(новых=0):
 
 def stop_reply():
     """Оборвать чтение ответа (правый Ctrl — перебить и сразу диктовать): и текущую часть, и остальные части хода."""
+    if новый_плеер():
+        if озвучка_активна():
+            плееру("stop")
+        return
     if _playing[0]:
         _playing[0] = False
         _reply_gen[0] += 1             # ожидание следующих частей этого хода тоже прекращается
@@ -1401,6 +1460,9 @@ def stop_reply():
 
 def skip_part():
     """Правый Alt: оборвать текущую часть ответа, следующие части хода играют дальше."""
+    if новый_плеер():
+        плееру("nextmsg")
+        return
     if _playing[0]:
         _skipmsg[0] = True             # части нового формата: к первой части следующего сообщения; старые — к следующей части
         _skip[0] = True
@@ -1411,6 +1473,9 @@ def skip_part():
 
 def prev_part():
     """Двойной правый Alt: оборвать текущую часть и сыграть предыдущую; в тишине — повторить последнюю сыгранную."""
+    if новый_плеер():
+        плееру("back")
+        return
     if _live_gen[0]:                   # цикл ответа жив (играет или ждёт следующую часть) — он сам шагнёт назад
         _back[0] = True
         if _playing[0]:
@@ -1827,6 +1892,9 @@ def _дождаться_дыры(gen, last_item):
 
 def replay_tail():
     """Повтор с последней сыгранной части, когда ничего не играет; Alt и двойной Alt ходят по истории так же."""
+    if новый_плеер():                 # 19.11.2026: включили автоозвучку / Alt в тишине — последнее сообщение играет новый плеер
+        плееру("последнее")
+        return
     _reply_gen[0] += 1
     gen = _reply_gen[0]
     _live_gen[0] = gen
@@ -2150,17 +2218,20 @@ def _pos_sender_шаг():
             log(f"место не отправлено: {e!r}")
 
 
-def добрать_свежее():
+def добрать_свежее(meta=None):
     """Положить в историю части ленты, которые ещё не звучали. Возвращает, сколько добавлено.
 
     12.10.2026: ответ, написанный без сообщения хозяина (вернулась помощница, сработало расписание), никто не ждёт —
     он озвучен домом, но не проигран и в историю не попадал; двойной Alt повторял предыдущий ответ вместо последнего."""
-    try:
-        with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
-            meta = json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        log(f"лента ответа не прочитана: {e!r}")
-        return 0
+    # 19.11.2026 (Грамота Премудрой, гонка №2): bg_loop отдаёт свой снимок ленты — второе чтение здесь забирало в _взяты первую
+    # часть хода, появившуюся между чтениями, и ход больше никогда не выбирался для игры
+    if meta is None:
+        try:
+            with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
+                meta = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            log(f"лента ответа не прочитана: {e!r}")
+            return 0
     n = 0
     _pending[:] = [o for o in (meta.get("pending") or []) if isinstance(o, (int, float))]   # 07.11: ждущие — и для игры по Alt
     # 04.11.2026: лента — очередь ходов; в историю идёт всё, чего там ещё нет (старое поле parts — копия последнего хода)
@@ -2184,6 +2255,7 @@ def добрать_свежее():
 
 _bg_done = set()         # ходы от уведомлений (bg в ленте), которые уже проиграны, оборваны стопом или заменены другими
 BG_FRESH_SEC = 900       # часть старше — не играем (после перезапуска/простоя старое не озвучивается)
+ЗАКРЫТ_ЖДАТЬ_С = 90      # 19.11.2026: ход закрыт домом, а новых частей нет столько секунд — дальше не ждём
 
 
 АВТО_ФАЙЛ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "автоозвучка.txt")
@@ -2269,6 +2341,9 @@ def bg_loop():
     было_вкл = [автоозвучка()]
     while True:
         time.sleep(1.5)
+        if новый_плеер():                 # 19.11.2026: фон и печать играет новый плеер
+            first = True
+            continue
         try:
             with urllib.request.urlopen(REPLY_URL + "voice_reply.json?_=%d" % time.time(), timeout=5) as r:
                 meta = json.loads(r.read().decode("utf-8"))
@@ -2291,7 +2366,7 @@ def bg_loop():
             continue
         if not вкл:                        # 07.11.2026: без автоозвучки ходы от уведомлений не играют — только в историю для Alt
             try:
-                добрать_свежее()
+                добрать_свежее(meta)
             except Exception as e:
                 log(f"добор в историю: {e!r}")
             continue
@@ -2304,7 +2379,7 @@ def bg_loop():
                 break
         if выбран is None:
             try:                           # играть нечего — всё пришедшее в историю (для Alt) и на диск
-                добрать_свежее()
+                добрать_свежее(meta)
             except Exception as e:
                 log(f"добор в историю: {e!r}")
             continue
@@ -2326,6 +2401,8 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
     по началу отправленного текста в поле `for`."""
     if not bg_turn:
         mark_voice(sent)
+    if новый_плеер():                 # 19.11.2026: ответ на голос играет новый плеер (вид хода «голос» в ленте v2)
+        return
     # 12.10.2026: сообщение диктуется несколькими фразами, которые хозяин потом переставляет и правит («Ой.» стёр, начало
     # заменил) — ключ по одной первой фразе с итоговым текстом не совпадал, и ответ молчал. Теперь годится любая из фраз.
     keys = [k for k in {norm(x)[:40] for x in ([sent] + list(фразы or []))} if len(k) >= 8] or [norm(sent)[:40]]
@@ -2352,6 +2429,7 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
     gap_from, gap_t0 = None, 0.0   # ord только что доигранной части: пока между ней и следующей в истории есть неготовое — ждём
     final = False
     deadline = time.time() + REPLY_WAIT_SEC
+    закрыт_t = None             # 19.11.2026: когда дом отметил ход закрытым (closed) — см. ниже
     try:
         while time.time() < deadline:
             if gen != _reply_gen[0]:
@@ -2414,6 +2492,19 @@ def speak_reply(sent, t_sent, фразы=None, bg_turn=None):
                 if meta is None:
                     continue
             parts = meta.get("parts") or [dict(meta, final=True)]     # старый формат — одна часть
+            # 19.11.2026 (Грамота Премудрой, причина №1 «не стартует»): дом пишет closed, когда ход кончился по журналу Claude,
+            # и ждут — сколько его предложений ещё не готово. Закрыт и ждать нечего — ход дочитан (финальной части могло и не
+            # быть: ход прервало новое сообщение). Закрыт, но новых частей нет ЗАКРЫТ_ЖДАТЬ_С — тоже конец (спящий хвост).
+            if meta.get("closed"):
+                закрыт_t = закрыт_t or time.time()
+                свежие = [p for p in parts if p.get("id") not in seen and p.get("id") not in _взяты and p.get("ts", 0) >= t_sent - 2]
+                if not свежие and (not meta.get("ждут") or time.time() - закрыт_t > ЗАКРЫТ_ЖДАТЬ_С):
+                    if not final:
+                        log(f"ответ: ход закрыт домом (ждут {meta.get('ждут', 0)}) — ожидание окончено без финальной части")
+                    final = True
+                    if not bg_turn:
+                        _ожидают.clear()
+                    continue
             for p in parts:
                 if p.get("id") in seen or p.get("id") in _взяты or p.get("ts", 0) < t_sent - 2:
                     continue
@@ -2714,8 +2805,8 @@ class Voice:
             # его фразу пробой в GigaAM — аддон Whisper на Нуксе ел 600 % CPU (петля эха). Прервать ответ — правый Ctrl.
             # 07.11.2026: и всю сессию прослушивания (_live_gen) — в паузах между предложениями эхо озвучки уходило в пробу GigaAM,
             # шаг висел на распознавании, пульс молчал 129 с, и сторож перезапустил плеер посреди ответа
-            if (voiced and self.wake_enabled and not self.rec and not self.busy and not _playing[0] and not _live_gen[0]
-                    and now - self.last_key > KEY_QUIET_SEC):
+            if (voiced and self.wake_enabled and not self.rec and not self.busy and not озвучка_активна()
+                    and now - self.last_key > KEY_QUIET_SEC):      # 19.11: озвучка_активна() знает и про новый плеер
                 self.voiced_n = 0
                 self.seg = list(self.ring)               # 0,3 с до начала речи
                 self.seg_t0 = now

@@ -5,7 +5,8 @@
 # прыгает при смене рабочих столов. Хозяин: «чтоб можно было увидеть, что там за ней»
 # (про полупрозрачность плашки) и попросил сразу три вида индикации:
 #   1. Плашка у кнопки «Пуск» на КАЖДОМ мониторе (полупрозрачная, альфа ~0.7); с 17.11 — слева от «Пуска»,
-#      а левее неё квадрат «Д» — статус диктовки (оранжевый — работает, серый — нет пульса status.json);
+#      а левее неё квадрат «Д» — статус диктовки: оранжевый — автоозвучка включена, серый — выключена правым Alt
+#      (19.11.2026 хозяин: «когда я отключаю, он не становится серым»), тёмно-серый — диктовка не отвечает (нет пульса);
 #   2. Маленькая цветная буква у текстовой каретки (нет каретки - у указателя мыши); с 17.11 — слева-снизу,
 #      догоняет медленнее (FOLLOW);
 #   3. Вспышка крупными буквами по центру монитора активного окна при смене раскладки.
@@ -86,6 +87,9 @@ FOLLOW = 0.12         # 17.11.2026: метка догоняет курсор м�
 DICT_STATUS = r"W:\Tools\dictate\status.json"
 DICT_ALIVE_SEC = 90
 DICT_ON = "#EF6C00"   # оранжевый — не путается с RU красным, EN синим, HE зелёным
+# 19.11.2026 хозяин: «Д» гасит правый Alt — выключение автоозвучки. Файл того же dictate.py: «вкл» / «выкл» (нет файла — выкл).
+DICT_AUTO = r"W:\Tools\dictate\автоозвучка.txt"
+DICT_DEAD = "#3C3C3C"  # тёмно-серый — программа диктовки не отвечает
 
 
 class RECT(ctypes.Structure):
@@ -306,7 +310,7 @@ class App:
         self.root.withdraw()
         self.plates = {}       # монитор -> overlay
         self.dplates = {}      # монитор -> квадрат статуса диктовки (17.11.2026)
-        self.dict_on = False
+        self.dict_on = "dead"   # 19.11.2026: "on" | "off" (автоозвучка) | "dead" (нет пульса)
         self.t_dict = 0
         self.mons = monitors()
         self.caret = make_overlay(self.root, "", 14, 0.75)
@@ -340,7 +344,7 @@ class App:
                     pass
                 del self.dplates[m]
         text, color = label_for(self.lid)
-        dcolor = DICT_ON if self.dict_on else GRAY
+        dcolor = {"on": DICT_ON, "off": GRAY}.get(self.dict_on, DICT_DEAD)
         for m in mons:
             o = self.plates.get(m)
             if o is None:
@@ -379,9 +383,17 @@ class App:
             import json, datetime
             with open(DICT_STATUS, encoding="utf-8") as f:
                 t = datetime.datetime.fromisoformat(json.load(f)["t"])
-            on = (datetime.datetime.now() - t).total_seconds() < DICT_ALIVE_SEC
+            alive = (datetime.datetime.now() - t).total_seconds() < DICT_ALIVE_SEC
         except Exception:
-            on = False
+            alive = False
+        if not alive:
+            on = "dead"
+        else:
+            try:
+                with open(DICT_AUTO, encoding="utf-8") as f:
+                    on = "on" if f.read().strip().lower().startswith("вкл") else "off"
+            except OSError:
+                on = "off"
         if on != self.dict_on:
             self.dict_on = on
             self.update_plates()
