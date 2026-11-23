@@ -43,8 +43,9 @@ pw = значение("/config/device_credentials/frigate_go2rtc_rtsp.txt", "П�
 )
 # 23.11 хозяин: «У нас вроде длинные скрипты передаются с помощью самбы» — так и делаем (как xps_put): весь сценарий одним файлом
 # в шару обмена Кузницы (/share/obmen/xps = \\192.168.77.62\obmen\xps), XPS выполняет его оттуда; нарезка по WinRM запрещена
-# (решение хозяина 11.11: «вырежи её, чтобы её просто больше не было»). Имя файла постоянное; после запуска он затирается
-# пустым (в нём пароль go2rtc), не удаляется.
+# (решение хозяина 11.11: «вырежи её, чтобы её просто больше не было»). После запуска файл прибирается в Запасник с пометкой
+# «секрет» (в нём пароль go2rtc; права 600) — не затирается и не удаляется (хозяин 23.11: «Удалять не надо, у нас для этого
+# есть запасник»).
 b64 = base64.b64encode(блок.encode("utf-8")).decode()
 ps = r'''
 $f = 'W:\mediamtx\mediamtx.yml'
@@ -72,5 +73,7 @@ try:
     c = p.run_command(sh, "powershell", ["-NoProfile", "-EncodedCommand", base64.b64encode(cmd.encode("utf-16-le")).decode()])
     out, err, rc = p.get_command_output(sh, c); p.cleanup_command(sh, c); p.close_shell(sh)
 finally:
-    open(локально, "w").close()   # затереть (пароль), файл остаётся пустым
+    import subprocess
+    subprocess.run(["/config/.local/bin/запасник.py", "прибрать", локально, "--секрет", "--кто", "dvor_v_mediamtx.py",
+                    "--почему", "сценарий mediamtx для XPS (пароль go2rtc) после запуска"], capture_output=True)
 print(out.decode("utf-8", "replace").strip(), ("ОШИБКА rc=%d" % rc) if rc else "")
