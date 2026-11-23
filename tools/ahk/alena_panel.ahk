@@ -11,10 +11,12 @@ DetectHiddenWindows false
 ПУСК := A_Programs   ; меню «Пуск» текущей учётки (Roaming\Microsoft\Windows\Start Menu\Programs)
 ; хозяин 23.11: «не будем там в панели писать слова, только иконки» — значок и всплывающая подсказка с названием
 ; 23.11 (дальше): «можно ещё значок показывать, который соответствует» — настоящие значки приложений, а не эмодзи:
-; Май — значок Home Assistant (icons\ha.png, favicon Штаба), Студия — значок VS Code (icons\vscode.png = code_150x150.png из его
+; Май — значок Home Assistant (icons\ha.png, favicon Штаба), Студия — значок VS Code (icons\vscode_crop.png = code_150x150.png из его установки без полей — хозяин: «мелковат»;
 ; установки; значок прямо из Code.exe AutoHotkey 2.0.28 не берёт — «Can't create control»).
 ЗНАЧКИ := A_ScriptDir "\icons"
-КНОПКИ := [[ЗНАЧКИ "\ha.png", ПУСК "\Май.lnk", "Май"], [ЗНАЧКИ "\vscode.png", ПУСК "\Студия.lnk", "Студия"]]
+; 23.11: «значок на Май тоже нужно сделать отдельным от домашнего ассистента» — свой: зелёный круг с «М» (icons\maj.png/.ico,
+; рисует Алёна, xps-machine/tools/ahk/icons)
+КНОПКИ := [[ЗНАЧКИ "\maj.png", ПУСК "\Май.lnk", "Май"], [ЗНАЧКИ "\vscode_crop.png", ПУСК "\Студия.lnk", "Студия"]]
 ШИРИНА := 40, РАЗМЕР := 26
 ФОН := "202020", ТЕКСТ := "E8E8E8", ПОДСВЕТКА := "2D2D2D"
 панели := []
@@ -89,7 +91,38 @@ DetectHiddenWindows false
         ToolTip(), было := 0
 }
 
+; 23.11: «справа от кнопки Пуск … показывать значок правильный» — окно Студии (Chrome --app) берёт значок со страницы, а Студия
+; открыта внутри HA → на кнопке окна значок Home Assistant. Ставим окну значок VS Code (WM_SETICON) и повторяем раз в 2 с:
+; Chrome возвращает свой при смене favicon. Окна узнаём по заголовку без « - Google Chrome» (обычная вкладка не трогается).
+; Значки окон: Студия — VS Code (из Code.exe), Май — свой (icons\maj.ico). Окно Май — «май – Home Assistant» без «Google Chrome».
+ЗНАЧКИ_ОКОН := Map()
+Значок(файл) {
+    big := Buffer(A_PtrSize, 0), small := Buffer(A_PtrSize, 0)
+    DllCall("Shell32\ExtractIconExW", "Str", файл, "Int", 0, "Ptr", big, "Ptr", small, "UInt", 1)
+    return [NumGet(big, "Ptr"), NumGet(small, "Ptr")]
+}
+Значки_окон() {
+    global ЗНАЧКИ_ОКОН
+    if !ЗНАЧКИ_ОКОН.Count {
+        ЗНАЧКИ_ОКОН["Studio Code Server"] := Значок(EnvGet("LOCALAPPDATA") "\Programs\Microsoft VS Code\Code.exe")
+        ЗНАЧКИ_ОКОН["май – Home Assistant"] := Значок(ЗНАЧКИ "\maj.ico")
+    }
+    for заголовок, зн in ЗНАЧКИ_ОКОН {
+        if !зн[1]
+            continue
+        for w in WinGetList(заголовок " ahk_exe chrome.exe") {
+            if InStr(WinGetTitle(w), "Google Chrome")
+                continue
+            if (SendMessage(0x7F, 1, 0, , w) != зн[1]) {         ; WM_GETICON ICON_BIG — уже наш?
+                SendMessage(0x80, 1, зн[1], , w)                  ; WM_SETICON ICON_BIG
+                SendMessage(0x80, 0, зн[2], , w)                  ; WM_SETICON ICON_SMALL
+            }
+        }
+    }
+}
+
 Построить()
 SetTimer(Поднять, 2000)
+SetTimer(Значки_окон, 2000)
 SetTimer(Наведение, 150)
 OnMessage(0x007E, (*) => SetTimer(Построить, -1500))    ; WM_DISPLAYCHANGE — мониторы/разрешение поменялись: перестроить
