@@ -121,6 +121,8 @@ DetectHiddenWindows false
     }
 }
 
+; Сторож живых обоев — отдельно: xps-machine/tools/oboi/oboi_storozh.ps1 (задача AlenaOboiStorozh); из AHK канал mpv не открылся.
+
 Построить()
 SetTimer(Поднять, 2000)
 SetTimer(Значки_окон, 2000)
