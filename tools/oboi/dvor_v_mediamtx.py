@@ -36,6 +36,10 @@ pw = значение("/config/device_credentials/frigate_go2rtc_rtsp.txt", "П�
     "  tambur_osnovnoi:\n"
     f"    source: rtsp://alena:{pw}@192.168.77.62:8554/tambur\n"
     "    sourceOnDemand: yes\n"
+    "  # 27.11: «Добавь здесь оба потока камеры» — основной уже есть (tambur_osnovnoi), субпоток камеры 640×360 в H.264\n"
+    "  tambur_sub:\n"
+    f"    source: rtsp://alena:{pw}@192.168.77.62:8554/tambur_sub_h264\n"
+    "    sourceOnDemand: yes\n"
     "  ~^tambur_(aura|b60)$:\n"
     f"    source: rtsp://alena:{pw}@192.168.77.62:8554/tambur_$G1\n"
     "    sourceOnDemand: yes\n"
@@ -76,4 +80,4 @@ finally:
     import subprocess
     subprocess.run(["/config/.local/bin/запасник.py", "прибрать", локально, "--секрет", "--кто", "dvor_v_mediamtx.py",
                     "--почему", "сценарий mediamtx для XPS (пароль go2rtc) после запуска"], capture_output=True)
-print(out.decode("utf-8", "replace").strip(), ("ОШИБКА rc=%d" % rc) if rc else "")
+print(out.decode("utf-8", "replace").strip(), ("ОШИБКА rc=%d\n" % rc + err.decode("utf-8", "replace")[:1500]) if rc else "")
